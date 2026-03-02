@@ -1,12 +1,5 @@
-name: Build Runner Binaries
-
-on:
-  push:
-    tags: ['v*']
-  workflow_dispatch:
-
-jobs:
   build:
+    name: build (${{ matrix.goos }}, ${{ matrix.goarch }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -20,16 +13,21 @@ jobs:
           - goos: darwin
             goarch: arm64
 
+
     steps:
       - uses: actions/checkout@v4
+
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
+
 
       - name: Determine version
         id: version
+        working-directory: runner
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -37,7 +35,9 @@ jobs:
             echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+
       - name: Build binary
+        working-directory: runner
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -50,37 +50,44 @@ jobs:
             ./cmd/runner/
           chmod +x "dist/${BINARY_NAME}"
 
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: runner/dist/dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}
+
 
   release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
+      needs: build
+      runs-on: ubuntu-latest
+      if: startsWith(github.ref, 'refs/tags/v')
+      permissions:
+        contents: write
 
-    steps:
-    - uses: actions/checkout@v4
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
 
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+      steps:
+        - uses: actions/checkout@v4
+
+
+        - name: Download all artifacts
+          uses: actions/download-artifact@v4
+          with:
+            path: dist
+            merge-multiple: true
+
+
+        - name: Create or update GitHub Release
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            TAG="${GITHUB_REF#refs/tags/}"
           
-          # Create release if it doesn't exist
-          if ! gh release view "$TAG" &>/dev/null; then
-            gh release create "$TAG" --generate-notes
-          fi
+            # Create release if it doesn't exist
+            if ! gh release view "$TAG" &>/dev/null; then
+              gh release create "$TAG" --generate-notes
+            fi
           
-          # Upload binaries (overwrites existing assets)
-          gh release upload "$TAG" dist/dragrace-runner-* --clobber
+            # Upload binaries (overwrites existing assets)
+            gh release upload "$TAG" dist/dragrace-runner-* --clobber
+
