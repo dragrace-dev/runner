@@ -70,8 +70,6 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - uses: actions/checkout@v4
-
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
