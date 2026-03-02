@@ -1,0 +1,249 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"dragrace/internal/auth"
+	"dragrace/internal/config"
+	"dragrace/internal/docker"
+	"dragrace/internal/executor"
+	"dragrace/internal/jobs"
+	natsclient "dragrace/internal/nats"
+	"dragrace/internal/process"
+	"dragrace/internal/registration"
+	"dragrace/internal/system"
+	"dragrace/internal/updater"
+	"dragrace/internal/version"
+
+	flag "github.com/spf13/pflag"
+)
+
+func main() {
+	// CLI flags (--long / -short)
+	natsURL := flag.StringP("nats-url", "n", "", "NATS server URL (overrides NATS_URL env)")
+	executorType := flag.StringP("executor", "e", "", "Executor type: docker or process (overrides RUNNER_EXECUTOR env)")
+	runnerID := flag.StringP("runner-id", "r", "", "Runner ID (overrides RUNNER_ID env)")
+	credsFile := flag.StringP("creds", "c", "", "Path to NATS credentials file")
+	backendURL := flag.StringP("backend-url", "b", "", "Backend URL for device flow (overrides BACKEND_URL env)")
+	idleTimeout := flag.IntP("idle-timeout", "i", 0, "Exit after N minutes of no job activity (0 = infinite)")
+	showVersion := flag.BoolP("version", "v", false, "Show version and exit")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "DragRace Runner v%s\n\n", version.Version)
+		fmt.Fprintf(os.Stderr, "Usage: runner [options] [command]\n\n")
+		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  login     Authenticate this runner (device code flow)\n")
+		fmt.Fprintf(os.Stderr, "  update    Self-update to the latest version\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
+		fmt.Fprintf(os.Stderr, "  NATS_URL              NATS server URL (default: nats://nats:4222)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_EXECUTOR       Executor type: docker, process (default: docker)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_ID             Runner identifier (default: runner-default)\n")
+		fmt.Fprintf(os.Stderr, "  BACKEND_URL           Backend HTTP URL for login (default: http://localhost:3000)\n")
+		fmt.Fprintf(os.Stderr, "  DOCKER_HOST           Docker socket (default: unix:///var/run/docker.sock)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_WORK_DIR       Working directory (default: /var/dragrace)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_IDLE_TIMEOUT   Idle timeout in minutes (default: 0 = infinite)\n")
+	}
+	flag.Parse()
+
+	// --version / -v
+	if *showVersion {
+		fmt.Printf("DragRace Runner v%s\n", version.Version)
+		os.Exit(0)
+	}
+
+	// Load configuration
+	cfg := config.Load()
+
+	// CLI flags override env vars
+	if *natsURL != "" {
+		cfg.NATSUrl = *natsURL
+	}
+	if *executorType != "" {
+		cfg.Executor = *executorType
+	}
+	if *runnerID != "" {
+		cfg.RunnerID = *runnerID
+	}
+	if *backendURL != "" {
+		cfg.BackendURL = *backendURL
+	}
+
+	// Handle subcommands
+	if flag.NArg() > 0 {
+		switch flag.Arg(0) {
+		case "update":
+			log.Printf("🔄 DragRace Runner %s — Self-Update", version.Version)
+			if err := updater.Update(cfg.UpdateURL); err != nil {
+				log.Fatalf("❌ Update failed: %v", err)
+			}
+			os.Exit(0)
+
+		case "login":
+			log.Printf("🏁 DragRace Runner v%s — Login", version.Version)
+			if err := auth.Login(cfg.BackendURL); err != nil {
+				log.Fatalf("❌ Login failed: %v", err)
+			}
+			os.Exit(0)
+		}
+	}
+
+	log.Printf("🏁 DragRace Runner v%s", version.Version)
+	log.Println("==========================================")
+
+	// Resolve credentials file
+	resolvedCreds := auth.ResolveCredsFile(*credsFile)
+	if resolvedCreds == "" {
+		log.Println("❌ No credentials found.")
+		log.Println("   Run 'runner login' to authenticate, or provide --creds <path>")
+		os.Exit(1)
+	}
+	log.Printf("🔑 Using credentials: %s", resolvedCreds)
+
+	log.Printf("Runner ID: %s", cfg.RunnerID)
+	log.Printf("NATS URL: %s", cfg.NATSUrl)
+	log.Printf("Executor: %s", cfg.Executor)
+
+	// Initialize NATS client with .creds authentication
+	nc, err := natsclient.NewClient(cfg, resolvedCreds)
+	if err != nil {
+		log.Fatalf("❌ Failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	// Collect hardware info (local — no backend needed)
+	log.Println("🔍 Collecting hardware configuration...")
+	hwInfo, err := system.CollectHardwareInfo()
+	if err != nil {
+		log.Fatalf("❌ Failed to collect hardware info: %v", err)
+	}
+
+	log.Printf("📊 Hardware: %s (%d cores, %.1f GB RAM)", hwInfo.CPUModel, hwInfo.CPUCores, hwInfo.MemoryTotalGB)
+	log.Printf("🔑 Fingerprint: %s", hwInfo.Fingerprint[:16]+"...")
+
+	// Register with retry (backend may not be ready yet)
+	var regResult *registration.RegisterResponse
+	maxRetries := 30
+	retryDelay := 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		regResult, err = registration.Register(nc.Conn(), cfg, hwInfo)
+		if err != nil {
+			log.Printf("⏳ [%d/%d] Registration failed, retrying... (%v)", attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			if retryDelay < 15*time.Second {
+				retryDelay = retryDelay * 3 / 2
+			}
+			continue
+		}
+		break
+	}
+
+	if regResult == nil {
+		log.Fatal("❌ Failed to register after all retries. Is the backend running?")
+	}
+
+	if regResult.RunnerID != "" {
+		log.Printf("📌 Backend runner ID: %s", regResult.RunnerID)
+	}
+
+	// ── Version Check ──────────────────────────────────────────────────
+	switch regResult.VersionStatus {
+	case "incompatible":
+		log.Fatalf("🛑 Runner version %s is no longer compatible (minimum: %s). Please update: ./runner update",
+			version.Version, regResult.MinVersion)
+	case "update_available":
+		log.Printf("⚠️  New version available: %s (current: %s). Run \"./runner update\" to upgrade.",
+			regResult.LatestVersion, version.Version)
+	case "ok", "":
+		// All good — no action needed
+	}
+
+	// Initialize executor based on config
+	var exec executor.Executor
+	switch cfg.Executor {
+	case "process":
+		exec, err = process.NewExecutor(cfg.WorkDir)
+		if err != nil {
+			log.Fatalf("❌ Failed to initialize process executor: %v", err)
+		}
+	case "docker":
+		exec, err = docker.NewExecutor(cfg.DockerHost)
+		if err != nil {
+			log.Fatalf("❌ Failed to initialize Docker executor: %v", err)
+		}
+	default:
+		log.Fatalf("❌ Unknown executor type: %s (use 'docker' or 'process')", cfg.Executor)
+	}
+	defer exec.Close()
+
+	// Initialize job handler
+	handler := jobs.NewHandler(nc, exec, cfg.RunnerID)
+
+	// Subscribe to job submit topic
+	_, err = nc.Subscribe("dragrace.dev.runner.job.submit", handler.HandleJobSubmit)
+	if err != nil {
+		log.Fatalf("❌ Failed to subscribe to jobs: %v", err)
+	}
+
+	log.Println("✅ Subscribed to job submit topic")
+	log.Println("⏳ Waiting for jobs...")
+
+	// Send initial heartbeat
+	if err := nc.SendHeartbeat("idle", nil); err != nil {
+		log.Printf("⚠️  Failed to send heartbeat: %v", err)
+	}
+
+	// Start heartbeat ticker
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			if err := nc.SendHeartbeat("idle", nil); err != nil {
+				log.Printf("⚠️  Failed to send heartbeat: %v", err)
+			}
+		}
+	}()
+
+	// Wait for interrupt signal or idle timeout
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	if *idleTimeout > 0 {
+		log.Printf("⏱️  Idle timeout: %d minutes", *idleTimeout)
+		idleDuration := time.Duration(*idleTimeout) * time.Minute
+		idleTimer := time.NewTimer(idleDuration)
+		defer idleTimer.Stop()
+
+		// Reset timer whenever a job arrives
+		go func() {
+			for range handler.JobActivity() {
+				idleTimer.Reset(idleDuration)
+			}
+		}()
+
+		select {
+		case <-sigChan:
+			log.Println("\n👋 Shutting down gracefully...")
+		case <-idleTimer.C:
+			log.Printf("💤 No jobs for %d minutes — shutting down.", *idleTimeout)
+		}
+	} else {
+		<-sigChan
+		log.Println("\n👋 Shutting down gracefully...")
+	}
+
+	// Send goodbye heartbeat so backend knows we're offline immediately
+	if err := nc.SendHeartbeat("offline", nil); err != nil {
+		log.Printf("⚠️  Failed to send goodbye heartbeat: %v", err)
+	} else {
+		log.Println("📤 Goodbye heartbeat sent")
+	}
+}
