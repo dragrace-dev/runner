@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 
 	"dragrace/internal/executor"
 	"dragrace/internal/metrics"
@@ -67,11 +68,8 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 	defer reader.Close()
 	io.Copy(io.Discard, reader)
 
-	// Build command
-	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("cd /workspace && chmod +x %s && ./%s", opts.ScriptPath, opts.ScriptPath)}
-	if opts.Stdout != "" {
-		cmd = []string{"/bin/sh", "-c", fmt.Sprintf("cd /workspace && chmod +x %s && ./%s > %s", opts.ScriptPath, opts.ScriptPath, opts.Stdout)}
-	}
+	// Build command with optional args
+	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
 	binds := []string{
@@ -100,16 +98,20 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 		}
 	}
 
+	// Build env vars
+	env := buildDockerEnv(opts)
+
 	// Create container
 	resp, err := e.client.ContainerCreate(ctx, &container.Config{
 		Image:      opts.Image,
 		Cmd:        cmd,
+		Env:        env,
 		Tty:        false,
 		WorkingDir: "/workspace",
 	}, &container.HostConfig{
 		Binds:       binds,
 		Resources:   resources,
-		NetworkMode: "none",
+		NetworkMode: "bridge", // Network enabled for init/build/validate (download deps, data, etc.)
 	}, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("failed to create container: %w", err)
@@ -174,11 +176,8 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 	defer reader.Close()
 	io.Copy(io.Discard, reader)
 
-	// Build command
-	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("cd /workspace && chmod +x %s && ./%s", opts.ScriptPath, opts.ScriptPath)}
-	if opts.Stdout != "" {
-		cmd = []string{"/bin/sh", "-c", fmt.Sprintf("cd /workspace && chmod +x %s && ./%s > %s", opts.ScriptPath, opts.ScriptPath, opts.Stdout)}
-	}
+	// Build command with optional args
+	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
 	binds := []string{
@@ -206,16 +205,20 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 		}
 	}
 
+	// Build env vars
+	env := buildDockerEnv(opts)
+
 	// Create container
 	resp, err := e.client.ContainerCreate(ctx, &container.Config{
 		Image:      opts.Image,
 		Cmd:        cmd,
+		Env:        env,
 		Tty:        false,
 		WorkingDir: "/workspace",
 	}, &container.HostConfig{
 		Binds:       binds,
 		Resources:   resources,
-		NetworkMode: "none",
+		NetworkMode: "none", // Network disabled for measured run (fairness + security)
 	}, nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container: %w", err)
@@ -302,4 +305,55 @@ func (e *Executor) getContainerLogs(ctx context.Context, containerID string) (st
 	}
 
 	return string(output), nil
+}
+
+// buildDockerCmd constructs the shell command for a container, including optional args.
+func buildDockerCmd(opts *executor.RunOptions) []string {
+	// Pre-check: verify the script is executable (must be committed with +x in Git).
+	// We use test -x instead of chmod +x because /workspace may be mounted read-only.
+	shell := fmt.Sprintf(
+		"cd /workspace && "+
+			"if ! test -x %s; then "+
+			"echo '❌ ERROR: %s is not executable.' >&2; "+
+			"echo '  Fix: chmod +x %s && git add %s' >&2; "+
+			"echo '  Or:  git update-index --chmod=+x %s' >&2; "+
+			"exit 126; "+
+			"fi && ./%s",
+		opts.ScriptPath,
+		opts.ScriptPath,
+		opts.ScriptPath, opts.ScriptPath,
+		opts.ScriptPath,
+		opts.ScriptPath,
+	)
+
+	// Append pass-through args
+	if len(opts.Args) > 0 {
+		for _, arg := range opts.Args {
+			shell += " " + shellQuote(arg)
+		}
+	}
+
+	// Redirect stdout if specified
+	if opts.Stdout != "" {
+		shell += " > " + opts.Stdout
+	}
+
+	return []string{"/bin/sh", "-c", shell}
+}
+
+// buildDockerEnv converts RunOptions.Env to the Docker []string format ("KEY=VALUE").
+func buildDockerEnv(opts *executor.RunOptions) []string {
+	if len(opts.Env) == 0 {
+		return nil
+	}
+	env := make([]string, 0, len(opts.Env))
+	for k, v := range opts.Env {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	return env
+}
+
+// shellQuote wraps a string in single quotes for safe shell usage.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

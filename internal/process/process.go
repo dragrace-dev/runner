@@ -152,20 +152,47 @@ func (e *Executor) RemoveDataDir(ctx context.Context, name string) error {
 func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) (*exec.Cmd, error) {
 	scriptPath := filepath.Join(opts.RepoDir, opts.ScriptPath)
 
-	// Make script executable
-	if err := os.Chmod(scriptPath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to chmod script %s: %w", scriptPath, err)
+	// Verify script is executable (must be committed with +x in Git)
+	info, err := os.Stat(scriptPath)
+	if err != nil {
+		return nil, fmt.Errorf("script not found: %s", scriptPath)
+	}
+	if info.Mode()&0111 == 0 {
+		return nil, fmt.Errorf(
+			"script %s is not executable.\n"+
+				"  Fix: chmod +x %s && git add %s\n"+
+				"  Or:  git update-index --chmod=+x %s",
+			opts.ScriptPath, opts.ScriptPath, opts.ScriptPath, opts.ScriptPath,
+		)
 	}
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", fmt.Sprintf("cd %s && ./%s", opts.RepoDir, opts.ScriptPath))
+	// Build shell command with optional args
+	shell := fmt.Sprintf("cd %s && ./%s", opts.RepoDir, opts.ScriptPath)
+	if len(opts.Args) > 0 {
+		for _, arg := range opts.Args {
+			shell += " " + shellQuote(arg)
+		}
+	}
 
-	// Set up environment with data dir
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shell)
+
+	// Set up environment with data dir + extra env vars
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("DRAGRACE_DATA_DIR=%s", filepath.Join(e.baseDataDir, opts.DataDir)),
 		fmt.Sprintf("DRAGRACE_REPO_DIR=%s", opts.RepoDir),
 	)
 
+	// Add extra env vars from options
+	for k, v := range opts.Env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+
 	return cmd, nil
+}
+
+// shellQuote wraps a string in single quotes for safe shell usage.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // ── Process Metrics Collector ──────────────────────────────────────────────

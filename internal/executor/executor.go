@@ -51,6 +51,12 @@ type RunOptions struct {
 
 	// Limits sets resource constraints for execution.
 	Limits *ResourceLimits
+
+	// Env is a map of extra environment variables to pass to the script.
+	Env map[string]string
+
+	// Args are extra positional arguments passed to the script ($@).
+	Args []string
 }
 
 // ResourceLimits defines resource constraints for script execution.

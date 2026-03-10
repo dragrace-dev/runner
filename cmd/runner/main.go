@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"dragrace/internal/process"
 	"dragrace/internal/registration"
 	"dragrace/internal/system"
+	"dragrace/internal/testmode"
 	"dragrace/internal/updater"
 	"dragrace/internal/version"
 
@@ -24,6 +26,13 @@ import (
 )
 
 func main() {
+	// Intercept subcommands that have their own flag sets BEFORE global flag.Parse().
+	// This prevents conflicts (e.g. test's -c/--challenge vs global -c/--creds).
+	if len(os.Args) > 1 && os.Args[1] == "test" {
+		runTestMode()
+		os.Exit(0)
+	}
+
 	// CLI flags (--long / -short)
 	natsURL := flag.StringP("nats-url", "n", "", "NATS server URL (overrides NATS_URL env)")
 	executorType := flag.StringP("executor", "e", "", "Executor type: docker or process (overrides RUNNER_EXECUTOR env)")
@@ -37,6 +46,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "DragRace Runner v%s\n\n", version.Version)
 		fmt.Fprintf(os.Stderr, "Usage: runner [options] [command]\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  test      Test a challenge locally (no account needed)\n")
 		fmt.Fprintf(os.Stderr, "  login     Authenticate this runner (device code flow)\n")
 		fmt.Fprintf(os.Stderr, "  update    Self-update to the latest version\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
@@ -90,6 +100,10 @@ func main() {
 			if err := auth.Login(cfg.BackendURL); err != nil {
 				log.Fatalf("❌ Login failed: %v", err)
 			}
+			os.Exit(0)
+
+		case "test":
+			runTestMode()
 			os.Exit(0)
 		}
 	}
@@ -245,5 +259,77 @@ func main() {
 		log.Printf("⚠️  Failed to send goodbye heartbeat: %v", err)
 	} else {
 		log.Println("📤 Goodbye heartbeat sent")
+	}
+}
+
+// runTestMode handles the "runner test" subcommand with its own flag set.
+func runTestMode() {
+	testFlags := flag.NewFlagSet("test", flag.ExitOnError)
+
+	challenge := testFlags.StringP("challenge", "c", "", "Path to challenge directory (required)")
+	solution := testFlags.StringP("solution", "s", "", "Path to solution directory")
+	execType := testFlags.String("executor", "docker", "Executor: docker or process")
+	phase := testFlags.StringP("phase", "p", "", "Run a single phase: init, build, run, validate")
+	envVars := testFlags.StringArrayP("env", "E", nil, "Environment variable (KEY=VALUE), repeatable")
+	noCache := testFlags.Bool("no-cache", false, "Force re-run of init (ignore cache)")
+	verbose := testFlags.Bool("verbose", false, "Show full script logs")
+	dataDir := testFlags.String("data-dir", "/tmp/dragrace-test", "Data directory for init cache")
+
+	testFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, "DragRace Runner v%s — Test Mode\n\n", version.Version)
+		fmt.Fprintf(os.Stderr, "Test a challenge locally without an account.\n\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  runner test --challenge <path> [--solution <path>] [options] [-- args...]\n\n")
+		fmt.Fprintf(os.Stderr, "Examples:\n")
+		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc -s ./solutions/baseline\n")
+		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc --executor process -E ROW_COUNT=1000\n")
+		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc --phase init --no-cache\n")
+		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc -s ./sol -- --small\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		testFlags.PrintDefaults()
+	}
+
+	// Parse everything after "test" — pflag handles "--" separation
+	testFlags.Parse(os.Args[2:]) // skip "runner" and "test"
+
+	// Everything after -- is pass-through args
+	passArgs := testFlags.Args()
+
+	if *challenge == "" {
+		testFlags.Usage()
+		fmt.Fprintf(os.Stderr, "\n❌ --challenge is required\n")
+		os.Exit(1)
+	}
+
+	// Parse phases
+	var phases []string
+	if *phase != "" {
+		phases = []string{*phase}
+	}
+
+	// Parse env vars
+	env := make(map[string]string)
+	for _, e := range *envVars {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) != 2 {
+			log.Fatalf("❌ Invalid env var format: %s (expected KEY=VALUE)", e)
+		}
+		env[parts[0]] = parts[1]
+	}
+
+	opts := &testmode.Options{
+		ChallengeDir: *challenge,
+		SolutionDir:  *solution,
+		Executor:     *execType,
+		Phases:       phases,
+		Env:          env,
+		Args:         passArgs,
+		NoCache:      *noCache,
+		Verbose:      *verbose,
+		DataDir:      *dataDir,
+	}
+
+	if err := testmode.Run(opts); err != nil {
+		log.Fatalf("❌ Test failed: %v", err)
 	}
 }
