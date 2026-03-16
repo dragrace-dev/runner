@@ -30,12 +30,12 @@ func NewClient(cfg *config.Config, credsFile string) (*Client, error) {
 		opts = append(opts, nats.UserCredentials(credsFile))
 	}
 
-	nc, err := nats.Connect(cfg.NATSUrl, opts...)
+	nc, err := nats.Connect(cfg.WsBackendURL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	log.Printf("✅ Connected to NATS at %s", cfg.NATSUrl)
+	log.Printf("✅ Connected to NATS at %s", cfg.WsBackendURL)
 
 	return &Client{
 		conn:     nc,

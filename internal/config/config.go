@@ -3,7 +3,7 @@ package config
 import "os"
 
 type Config struct {
-	NATSUrl    string
+	WsBackendURL string
 	RunnerID   string
 	DockerHost string
 	WorkDir    string
@@ -14,13 +14,13 @@ type Config struct {
 
 func Load() *Config {
 	return &Config{
-		NATSUrl:    getEnv("NATS_URL", "nats://nats:4222"),
+		WsBackendURL: getEnv("WS_BACKEND_URL", "wss://ws.dragrace.dev"),
 		RunnerID:   getEnv("RUNNER_ID", "runner-default"),
 		DockerHost: getEnv("DOCKER_HOST", "unix:///var/run/docker.sock"),
 		WorkDir:    getEnv("RUNNER_WORK_DIR", "/var/dragrace"),
 		Executor:   getEnv("RUNNER_EXECUTOR", "docker"),
 		UpdateURL:  getEnv("RUNNER_UPDATE_URL", ""),
-		BackendURL: getEnv("BACKEND_URL", "http://localhost:3000"),
+		BackendURL: getEnv("BACKEND_URL", "https://dragrace.dev"),
 	}
 }
 

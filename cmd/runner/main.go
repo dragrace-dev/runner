@@ -34,7 +34,7 @@ func main() {
 	}
 
 	// CLI flags (--long / -short)
-	natsURL := flag.StringP("nats-url", "n", "", "NATS server URL (overrides NATS_URL env)")
+	wsBackendURL := flag.StringP("ws-backend-url", "w", "", "WebSocket backend URL (overrides WS_BACKEND_URL env)")
 	executorType := flag.StringP("executor", "e", "", "Executor type: docker or process (overrides RUNNER_EXECUTOR env)")
 	runnerID := flag.StringP("runner-id", "r", "", "Runner ID (overrides RUNNER_ID env)")
 	credsFile := flag.StringP("creds", "c", "", "Path to NATS credentials file")
@@ -52,10 +52,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  NATS_URL              NATS server URL (default: nats://nats:4222)\n")
+		fmt.Fprintf(os.Stderr, "  WS_BACKEND_URL        WebSocket backend URL (default: wss://ws.dragrace.dev)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_EXECUTOR       Executor type: docker, process (default: docker)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_ID             Runner identifier (default: runner-default)\n")
-		fmt.Fprintf(os.Stderr, "  BACKEND_URL           Backend HTTP URL for login (default: http://localhost:3000)\n")
+		fmt.Fprintf(os.Stderr, "  BACKEND_URL           Backend HTTP URL for login (default: https://dragrace.dev)\n")
 		fmt.Fprintf(os.Stderr, "  DOCKER_HOST           Docker socket (default: unix:///var/run/docker.sock)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_WORK_DIR       Working directory (default: /var/dragrace)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_IDLE_TIMEOUT   Idle timeout in minutes (default: 0 = infinite)\n")
@@ -72,8 +72,8 @@ func main() {
 	cfg := config.Load()
 
 	// CLI flags override env vars
-	if *natsURL != "" {
-		cfg.NATSUrl = *natsURL
+	if *wsBackendURL != "" {
+		cfg.WsBackendURL = *wsBackendURL
 	}
 	if *executorType != "" {
 		cfg.Executor = *executorType
@@ -121,7 +121,7 @@ func main() {
 	log.Printf("🔑 Using credentials: %s", resolvedCreds)
 
 	log.Printf("Runner ID: %s", cfg.RunnerID)
-	log.Printf("NATS URL: %s", cfg.NATSUrl)
+	log.Printf("WS Backend URL: %s", cfg.WsBackendURL)
 	log.Printf("Executor: %s", cfg.Executor)
 
 	// Initialize NATS client with .creds authentication
