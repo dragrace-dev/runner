@@ -93,3 +93,64 @@ func ValidateSolutionDir(dir string) (*config.SolutionConfig, error) {
 
 	return &spec, nil
 }
+
+// ValidateUnifiedDir loads a unified dragrace.yaml that may contain both
+// a challenge and a solution document. It validates both parts and checks
+// that all referenced scripts exist relative to dir.
+func ValidateUnifiedDir(dir string) (*config.ChallengeSpec, *config.SolutionConfig, error) {
+	yamlPath := filepath.Join(dir, "dragrace.yaml")
+	challenge, solution, err := config.ParseUnifiedFile(yamlPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Validate challenge part (if present)
+	if challenge != nil {
+		if challenge.Type != "challenge" {
+			return nil, nil, fmt.Errorf("%s: challenge document type must be 'challenge'", yamlPath)
+		}
+		if challenge.Challenge.ID == "" {
+			return nil, nil, fmt.Errorf("%s: challenge.id is required", yamlPath)
+		}
+		if challenge.Challenge.Name == "" {
+			return nil, nil, fmt.Errorf("%s: challenge.name is required", yamlPath)
+		}
+		if challenge.Init != nil && challenge.Init.Script != "" {
+			scriptPath := filepath.Join(dir, challenge.Init.Script)
+			if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("init script not found: %s", scriptPath)
+			}
+		}
+		if challenge.Validate != nil && challenge.Validate.Script != "" {
+			scriptPath := filepath.Join(dir, challenge.Validate.Script)
+			if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("validate script not found: %s", scriptPath)
+			}
+		}
+	}
+
+	// Validate solution part (if present)
+	if solution != nil {
+		if solution.Type != "solution" {
+			return nil, nil, fmt.Errorf("%s: solution document type must be 'solution'", yamlPath)
+		}
+		if solution.Runtime.Docker == "" {
+			return nil, nil, fmt.Errorf("%s: runtime.docker is required", yamlPath)
+		}
+		if solution.Run.Script == "" {
+			return nil, nil, fmt.Errorf("%s: run.script is required", yamlPath)
+		}
+		if solution.Build != nil && solution.Build.Script != "" {
+			scriptPath := filepath.Join(dir, solution.Build.Script)
+			if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("build script not found: %s", scriptPath)
+			}
+		}
+		scriptPath := filepath.Join(dir, solution.Run.Script)
+		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+			return nil, nil, fmt.Errorf("run script not found: %s", scriptPath)
+		}
+	}
+
+	return challenge, solution, nil
+}

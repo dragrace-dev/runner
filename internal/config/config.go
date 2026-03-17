@@ -19,7 +19,7 @@ func Load() *Config {
 		DockerHost: getEnv("DOCKER_HOST", "unix:///var/run/docker.sock"),
 		WorkDir:    getEnv("RUNNER_WORK_DIR", "/var/dragrace"),
 		Executor:   getEnv("RUNNER_EXECUTOR", "docker"),
-		UpdateURL:  getEnv("RUNNER_UPDATE_URL", ""),
+		UpdateURL:  getEnv("RUNNER_UPDATE_URL", "https://github.com/dragrace-dev/runner/releases/latest/download"),
 		BackendURL: getEnv("BACKEND_URL", "https://dragrace.dev"),
 	}
 }

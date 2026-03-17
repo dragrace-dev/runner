@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,17 +13,10 @@ func ParseChallengeSpec(yamlContent []byte) (*ChallengeSpec, error) {
 	return &spec, nil
 }
 
-// ParseSolutionConfig parses a solution.yml file into a SolutionConfig
+// ParseSolutionConfig parses a dragrace.yaml file into a SolutionConfig.
+// It supports both single-document (solution only) and unified files
+// (challenge + solution). In unified files, only the solution document
+// is extracted — the challenge section is ignored for security.
 func ParseSolutionConfig(filePath string) (*SolutionConfig, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	var config SolutionConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
+	return ExtractSolutionFromFile(filePath)
 }

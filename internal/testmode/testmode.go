@@ -62,23 +62,41 @@ func Run(opts *Options) error {
 		return fmt.Errorf("invalid challenge path: %w", err)
 	}
 
-	// ── Validate challenge spec ─────────────────────────────────────────
-	challengeSpec, err := ValidateChallengeDir(challengeDir)
-	if err != nil {
-		return fmt.Errorf("challenge validation failed: %w", err)
-	}
-	fmt.Printf("📋 Challenge: %s (%s)\n", challengeSpec.Challenge.Name, challengeSpec.Challenge.ID)
-
-	// ── Validate solution spec (if provided) ────────────────────────────
+	// ── Validate challenge + solution specs ─────────────────────────────
+	var challengeSpec *config.ChallengeSpec
 	var solutionSpec *config.SolutionConfig
 	var solutionDir string
 
-	if opts.SolutionDir != "" {
+	if opts.SolutionDir == "" {
+		// No --solution flag: try unified format (challenge + solution in one file)
+		cs, ss, err := ValidateUnifiedDir(challengeDir)
+		if err != nil {
+			return fmt.Errorf("challenge validation failed: %w", err)
+		}
+		challengeSpec = cs
+		if ss != nil {
+			// Unified file contains both — use challengeDir for solution scripts too
+			solutionSpec = ss
+			solutionDir = challengeDir
+			fmt.Printf("📋 Challenge: %s (%s)\n", challengeSpec.Challenge.Name, challengeSpec.Challenge.ID)
+			fmt.Printf("📋 Solution:  (embedded in unified dragrace.yaml)\n")
+		} else {
+			// Only challenge found — no solution
+			fmt.Printf("📋 Challenge: %s (%s)\n", challengeSpec.Challenge.Name, challengeSpec.Challenge.ID)
+		}
+	} else {
+		// Separate dirs: validate each independently
+		var err error
+		challengeSpec, err = ValidateChallengeDir(challengeDir)
+		if err != nil {
+			return fmt.Errorf("challenge validation failed: %w", err)
+		}
+		fmt.Printf("📋 Challenge: %s (%s)\n", challengeSpec.Challenge.Name, challengeSpec.Challenge.ID)
+
 		solutionDir, err = filepath.Abs(opts.SolutionDir)
 		if err != nil {
 			return fmt.Errorf("invalid solution path: %w", err)
 		}
-
 		solutionSpec, err = ValidateSolutionDir(solutionDir)
 		if err != nil {
 			return fmt.Errorf("solution validation failed: %w", err)
@@ -95,14 +113,12 @@ func Run(opts *Options) error {
 	}
 	fmt.Println()
 
-	// ── Check if solution is required ───────────────────────────────────
+	// ── Check if solution is required ───────────────────────────────
 	needsSolution := ShouldRunPhase(opts.Phases, PhaseBuild) || ShouldRunPhase(opts.Phases, PhaseRun)
 	if needsSolution && solutionSpec == nil {
-		// Only error if explicitly requesting build/run, or if running all phases
 		if len(opts.Phases) > 0 {
 			return fmt.Errorf("--solution is required for phases: build, run")
 		}
-		// Running all phases without solution: only run init + validate
 		log.Println("ℹ️  No --solution provided, running init and validate only")
 	}
 
@@ -244,7 +260,7 @@ func Run(opts *Options) error {
 			ScriptPath:   solutionSpec.Run.Script,
 			RepoDir:      solutionDir,
 			DataDir:      volumeName,
-			ReadOnlyData: true,
+			ReadOnlyData: false, // Solution needs to write output to /data
 			Stdout:       solutionSpec.Run.Stdout,
 			Env:          opts.Env,
 			Args:         opts.Args,

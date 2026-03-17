@@ -343,10 +343,11 @@ func buildDockerCmd(opts *executor.RunOptions) []string {
 
 // buildDockerEnv converts RunOptions.Env to the Docker []string format ("KEY=VALUE").
 func buildDockerEnv(opts *executor.RunOptions) []string {
-	if len(opts.Env) == 0 {
-		return nil
+	// Always provide standard DragRace env vars so scripts work in both modes
+	env := []string{
+		"DRAGRACE_REPO_DIR=/workspace",
+		"DRAGRACE_DATA_DIR=/data",
 	}
-	env := make([]string, 0, len(opts.Env))
 	for k, v := range opts.Env {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}

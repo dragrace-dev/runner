@@ -58,6 +58,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  BACKEND_URL           Backend HTTP URL for login (default: https://dragrace.dev)\n")
 		fmt.Fprintf(os.Stderr, "  DOCKER_HOST           Docker socket (default: unix:///var/run/docker.sock)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_WORK_DIR       Working directory (default: /var/dragrace)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_UPDATE_URL     Base URL for self-update binaries (default: GitHub releases)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_IDLE_TIMEOUT   Idle timeout in minutes (default: 0 = infinite)\n")
 	}
 	flag.Parse()
@@ -282,6 +283,7 @@ func runTestMode() {
 		fmt.Fprintf(os.Stderr, "  runner test --challenge <path> [--solution <path>] [options] [-- args...]\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc -s ./solutions/baseline\n")
+		fmt.Fprintf(os.Stderr, "  runner test -c ./my-challenge                              # unified file\n")
 		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc --executor process -E ROW_COUNT=1000\n")
 		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc --phase init --no-cache\n")
 		fmt.Fprintf(os.Stderr, "  runner test -c ./challenges/1brc -s ./sol -- --small\n\n")
