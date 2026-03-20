@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -130,7 +131,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Failed to connect to NATS: %v", err)
 	}
-	defer nc.Close()
+	defer func() {
+		if nc != nil {
+			nc.Close()
+		}
+	}()
 
 	// Collect hardware info (local — no backend needed)
 	log.Println("🔍 Collecting hardware configuration...")
@@ -167,6 +172,25 @@ func main() {
 	if regResult.RunnerID != "" {
 		log.Printf("📌 Backend runner ID: %s", regResult.RunnerID)
 	}
+	backendRunnerID := regResult.RunnerID
+	if backendRunnerID == "" {
+		backendRunnerID = cfg.RunnerID
+	}
+
+	if regResult.Credentials != "" {
+		if err := os.MkdirAll(filepath.Dir(resolvedCreds), 0700); err != nil {
+			log.Fatalf("❌ Failed to prepare credentials directory: %v", err)
+		}
+		if err := os.WriteFile(resolvedCreds, []byte(regResult.Credentials), 0600); err != nil {
+			log.Fatalf("❌ Failed to write refreshed credentials: %v", err)
+		}
+		nc.Close()
+		nc, err = natsclient.NewClient(cfg, resolvedCreds)
+		if err != nil {
+			log.Fatalf("❌ Failed to reconnect with runner-scoped credentials: %v", err)
+		}
+		log.Println("🔐 Switched to runner-scoped NATS credentials")
+	}
 
 	// ── Version Check ──────────────────────────────────────────────────
 	switch regResult.VersionStatus {
@@ -184,6 +208,7 @@ func main() {
 	var exec executor.Executor
 	switch cfg.Executor {
 	case "process":
+		log.Println("⚠️  Process executor enabled: this mode is less isolated than Docker and should be used only when your org accepts the risk.")
 		exec, err = process.NewExecutor(cfg.WorkDir)
 		if err != nil {
 			log.Fatalf("❌ Failed to initialize process executor: %v", err)
@@ -199,20 +224,24 @@ func main() {
 	defer exec.Close()
 
 	// Initialize job handler
-	handler := jobs.NewHandler(nc, exec, cfg.RunnerID)
+	handler := jobs.NewHandler(nc, exec, backendRunnerID)
 
 	// Subscribe to job submit topic
-	_, err = nc.Subscribe("dragrace.dev.runner.job.submit", handler.HandleJobSubmit)
+	jobSubject := fmt.Sprintf("dragrace.dev.runner.%s.job.submit", backendRunnerID)
+	_, err = nc.Subscribe(jobSubject, handler.HandleJobSubmit)
 	if err != nil {
 		log.Fatalf("❌ Failed to subscribe to jobs: %v", err)
 	}
 
-	log.Println("✅ Subscribed to job submit topic")
+	log.Printf("✅ Subscribed to job submit topic: %s", jobSubject)
 	log.Println("⏳ Waiting for jobs...")
 
 	// Send initial heartbeat
-	if err := nc.SendHeartbeat("idle", nil); err != nil {
+	if err := nc.SendHeartbeat(backendRunnerID, "idle", nil); err != nil {
 		log.Printf("⚠️  Failed to send heartbeat: %v", err)
+	}
+	if err := nc.SendRunnerConfig(backendRunnerID, hwInfo); err != nil {
+		log.Printf("⚠️  Failed to send runner config: %v", err)
 	}
 
 	// Start heartbeat ticker
@@ -221,7 +250,7 @@ func main() {
 
 	go func() {
 		for range ticker.C {
-			if err := nc.SendHeartbeat("idle", nil); err != nil {
+			if err := nc.SendHeartbeat(backendRunnerID, "idle", nil); err != nil {
 				log.Printf("⚠️  Failed to send heartbeat: %v", err)
 			}
 		}
@@ -256,7 +285,7 @@ func main() {
 	}
 
 	// Send goodbye heartbeat so backend knows we're offline immediately
-	if err := nc.SendHeartbeat("offline", nil); err != nil {
+	if err := nc.SendHeartbeat(backendRunnerID, "offline", nil); err != nil {
 		log.Printf("⚠️  Failed to send goodbye heartbeat: %v", err)
 	} else {
 		log.Println("📤 Goodbye heartbeat sent")

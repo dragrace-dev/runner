@@ -18,6 +18,7 @@ import (
 type RegisterResponse struct {
 	RunnerID      string `json:"runner_id"`
 	Status        string `json:"status"`                   // "registered"
+	Credentials   string `json:"credentials,omitempty"`    // optional runner-scoped NATS creds
 	VersionStatus string `json:"version_status,omitempty"` // "ok", "update_available", "incompatible"
 	LatestVersion string `json:"latest_version,omitempty"`
 	MinVersion    string `json:"min_version,omitempty"`

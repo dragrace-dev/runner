@@ -85,9 +85,9 @@ func (c *Client) Publish(subject string, data interface{}) error {
 }
 
 // Send heartbeat
-func (c *Client) SendHeartbeat(status string, currentJobID *string) error {
+func (c *Client) SendHeartbeat(runnerID string, status string, currentJobID *string) error {
+	subject := fmt.Sprintf("dragrace.dev.backend.runner.%s.heartbeat", runnerID)
 	heartbeat := map[string]interface{}{
-		"runner_id": c.config.RunnerID,
 		"status":    status,
 		"timestamp": time.Now().Format(time.RFC3339),
 	}
@@ -96,18 +96,18 @@ func (c *Client) SendHeartbeat(status string, currentJobID *string) error {
 		heartbeat["current_job_id"] = *currentJobID
 	}
 
-	return c.Publish("dragrace.dev.backend.runner.heartbeat", heartbeat)
+	return c.Publish(subject, heartbeat)
 }
 
 // SendRunnerConfig sends complete hardware configuration to backend
-func (c *Client) SendRunnerConfig(hwInfo interface{}) error {
+func (c *Client) SendRunnerConfig(runnerID string, hwInfo interface{}) error {
+	subject := fmt.Sprintf("dragrace.dev.backend.runner.%s.config", runnerID)
 	message := map[string]interface{}{
-		"runner_id":       c.config.RunnerID,
 		"hardware_config": hwInfo,
 		"timestamp":       time.Now().Format(time.RFC3339),
 	}
 
-	return c.Publish("dragrace.dev.backend.runner.config", message)
+	return c.Publish(subject, message)
 }
 
 // Request sends a request/reply message with auth headers.

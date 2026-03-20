@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"strings"
 
 	"dragrace/internal/executor"
@@ -309,21 +310,24 @@ func (e *Executor) getContainerLogs(ctx context.Context, containerID string) (st
 
 // buildDockerCmd constructs the shell command for a container, including optional args.
 func buildDockerCmd(opts *executor.RunOptions) []string {
+	if !isSafeRelativePath(opts.ScriptPath) {
+		// Fail inside container command for consistent UX
+		return []string{"/bin/sh", "-c", "echo '❌ ERROR: invalid script path' >&2; exit 126"}
+	}
+	quotedScript := shellQuote(opts.ScriptPath)
+
 	// Pre-check: verify the script is executable (must be committed with +x in Git).
 	// We use test -x instead of chmod +x because /workspace may be mounted read-only.
 	shell := fmt.Sprintf(
 		"cd /workspace && "+
 			"if ! test -x %s; then "+
-			"echo '❌ ERROR: %s is not executable.' >&2; "+
-			"echo '  Fix: chmod +x %s && git add %s' >&2; "+
-			"echo '  Or:  git update-index --chmod=+x %s' >&2; "+
+			"echo '❌ ERROR: script is not executable.' >&2; "+
+			"echo '  Fix: chmod +x <script> && git add <script>' >&2; "+
+			"echo '  Or:  git update-index --chmod=+x <script>' >&2; "+
 			"exit 126; "+
 			"fi && ./%s",
-		opts.ScriptPath,
-		opts.ScriptPath,
-		opts.ScriptPath, opts.ScriptPath,
-		opts.ScriptPath,
-		opts.ScriptPath,
+		quotedScript,
+		quotedScript,
 	)
 
 	// Append pass-through args
@@ -335,7 +339,10 @@ func buildDockerCmd(opts *executor.RunOptions) []string {
 
 	// Redirect stdout if specified
 	if opts.Stdout != "" {
-		shell += " > " + opts.Stdout
+		if !isSafeRelativePath(opts.Stdout) {
+			return []string{"/bin/sh", "-c", "echo '❌ ERROR: invalid stdout path' >&2; exit 126"}
+		}
+		shell += " > " + shellQuote(opts.Stdout)
 	}
 
 	return []string{"/bin/sh", "-c", shell}
@@ -357,4 +364,12 @@ func buildDockerEnv(opts *executor.RunOptions) []string {
 // shellQuote wraps a string in single quotes for safe shell usage.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func isSafeRelativePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	return !strings.HasPrefix(clean, "..") && !filepath.IsAbs(clean)
 }

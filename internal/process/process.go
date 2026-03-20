@@ -150,6 +150,9 @@ func (e *Executor) RemoveDataDir(ctx context.Context, name string) error {
 
 // buildCommand creates the exec.Cmd for a script execution.
 func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) (*exec.Cmd, error) {
+	if !isSafeRelativePath(opts.ScriptPath) {
+		return nil, fmt.Errorf("invalid script path: %s", opts.ScriptPath)
+	}
 	scriptPath := filepath.Join(opts.RepoDir, opts.ScriptPath)
 
 	// Verify script is executable (must be committed with +x in Git)
@@ -167,7 +170,7 @@ func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) 
 	}
 
 	// Build shell command with optional args
-	shell := fmt.Sprintf("cd %s && ./%s", opts.RepoDir, opts.ScriptPath)
+	shell := fmt.Sprintf("cd %s && ./%s", shellQuote(opts.RepoDir), shellQuote(opts.ScriptPath))
 	if len(opts.Args) > 0 {
 		for _, arg := range opts.Args {
 			shell += " " + shellQuote(arg)
@@ -193,6 +196,14 @@ func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) 
 // shellQuote wraps a string in single quotes for safe shell usage.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func isSafeRelativePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	return !strings.HasPrefix(clean, "..") && !filepath.IsAbs(clean)
 }
 
 // ── Process Metrics Collector ──────────────────────────────────────────────

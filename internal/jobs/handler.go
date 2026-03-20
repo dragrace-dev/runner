@@ -28,9 +28,11 @@ type GitSource struct {
 
 // JobMessage is the message received from backend via NATS
 type JobMessage struct {
-	JobID     string `json:"job_id"`
-	RunID     string `json:"run_id"`
-	Challenge struct {
+	JobID           string `json:"job_id"`
+	RunID           string `json:"run_id"`
+	RunnerID        string `json:"runner_id,omitempty"`
+	AssignmentNonce string `json:"assignment_nonce,omitempty"`
+	Challenge       struct {
 		ID     string    `json:"id"`
 		Source GitSource `json:"source"`
 	} `json:"challenge"`
@@ -72,7 +74,11 @@ func (h *Handler) HandleJobSubmit(msg *nats.Msg) {
 	var job JobMessage
 	if err := json.Unmarshal(msg.Data, &job); err != nil {
 		log.Printf("❌ Failed to parse job message: %v", err)
-		h.sendJobFailed("", "", "Failed to parse job", err.Error())
+		h.sendJobFailed("", "", "", "Failed to parse job", err.Error())
+		return
+	}
+	if job.RunnerID != "" && job.RunnerID != h.runnerID {
+		log.Printf("⚠️  Ignoring job %s for runner %s", job.JobID, job.RunnerID)
 		return
 	}
 
@@ -84,7 +90,7 @@ func (h *Handler) HandleJobSubmit(msg *nats.Msg) {
 	default:
 	}
 
-	h.sendJobStarted(job.JobID)
+	h.sendJobStarted(job.JobID, job.RunID, job.AssignmentNonce)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(job.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -92,11 +98,11 @@ func (h *Handler) HandleJobSubmit(msg *nats.Msg) {
 	runMetrics, err := h.executeJob(ctx, &job)
 	if err != nil {
 		log.Printf("❌ Job %s failed: %v", job.JobID, err)
-		h.sendJobFailed(job.JobID, job.RunID, "Job failed", err.Error())
+		h.sendJobFailed(job.JobID, job.RunID, job.AssignmentNonce, "Job failed", err.Error())
 		return
 	}
 
-	h.sendJobCompleted(job.JobID, job.RunID, runMetrics)
+	h.sendJobCompleted(job.JobID, job.RunID, job.AssignmentNonce, runMetrics)
 }
 
 func (h *Handler) executeJob(ctx context.Context, job *JobMessage) (*metrics.RunMetrics, error) {
@@ -279,34 +285,40 @@ func (h *Handler) loadSolutionSpec(repoDir string) (*config.SolutionConfig, erro
 	return &spec, nil
 }
 
-func (h *Handler) sendJobStarted(jobID string) {
+func (h *Handler) sendJobStarted(jobID, runID, nonce string) {
 	msg := map[string]interface{}{
-		"job_id":    jobID,
-		"runner_id": h.runnerID,
-		"status":    "running",
+		"job_id":           jobID,
+		"run_id":           runID,
+		"assignment_nonce": nonce,
+		"started_at":       time.Now().Format(time.RFC3339),
 	}
-	h.natsClient.Publish("dragrace.dev.runner.job.started", msg)
+	subject := fmt.Sprintf("dragrace.dev.backend.runner.%s.job.started", h.runnerID)
+	h.natsClient.Publish(subject, msg)
 }
 
-func (h *Handler) sendJobCompleted(jobID, runID string, runMetrics *metrics.RunMetrics) {
+func (h *Handler) sendJobCompleted(jobID, runID, nonce string, runMetrics *metrics.RunMetrics) {
 	msg := map[string]interface{}{
-		"job_id":    jobID,
-		"run_id":    runID,
-		"runner_id": h.runnerID,
-		"status":    "completed",
-		"metrics":   runMetrics,
+		"job_id":           jobID,
+		"run_id":           runID,
+		"assignment_nonce": nonce,
+		"status":           "completed",
+		"metrics":          runMetrics,
+		"completed_at":     time.Now().Format(time.RFC3339),
 	}
-	h.natsClient.Publish("dragrace.dev.runner.job.completed", msg)
+	subject := fmt.Sprintf("dragrace.dev.backend.runner.%s.job.completed", h.runnerID)
+	h.natsClient.Publish(subject, msg)
 }
 
-func (h *Handler) sendJobFailed(jobID, runID, errorMsg, errorLogs string) {
+func (h *Handler) sendJobFailed(jobID, runID, nonce, errorMsg, errorLogs string) {
 	msg := map[string]interface{}{
-		"job_id":    jobID,
-		"run_id":    runID,
-		"runner_id": h.runnerID,
-		"status":    "failed",
-		"error":     errorMsg,
-		"logs":      errorLogs,
+		"job_id":           jobID,
+		"run_id":           runID,
+		"assignment_nonce": nonce,
+		"status":           "failed",
+		"error_message":    errorMsg,
+		"error_logs":       errorLogs,
+		"failed_at":        time.Now().Format(time.RFC3339),
 	}
-	h.natsClient.Publish("dragrace.dev.runner.job.failed", msg)
+	subject := fmt.Sprintf("dragrace.dev.backend.runner.%s.job.failed", h.runnerID)
+	h.natsClient.Publish(subject, msg)
 }
