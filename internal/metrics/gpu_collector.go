@@ -61,8 +61,10 @@ type GPUTimeSeries struct {
 
 // GPUAggregates contains computed GPU statistics
 type GPUAggregates struct {
-	// Per-GPU aggregates (indexed by device_id)
-	PerGPU map[int]GPUDeviceAggregates `json:"per_gpu"`
+	// Per-GPU aggregates, keyed "vendor:device_id". A plain device id would
+	// collide on a machine holding both an NVIDIA and an AMD card, which both
+	// number their devices from zero.
+	PerGPU map[string]GPUDeviceAggregates `json:"per_gpu"`
 	
 	// Overall aggregates (across all GPUs)
 	TotalMemoryUsedMB     float64 `json:"total_memory_used_mb"`
@@ -96,7 +98,7 @@ type GPUDeviceAggregates struct {
 
 // GPUCollector collects GPU metrics
 type GPUCollector struct {
-	vendor           GPUVendor
+	vendors          []GPUVendor
 	samplingInterval time.Duration
 	samples          []GPUSample
 	stopChan         chan struct{}
@@ -109,11 +111,12 @@ func NewGPUCollector(samplingIntervalMs int) *GPUCollector {
 		samplingIntervalMs = 100
 	}
 	
-	// Detect GPU vendor
-	vendor := detectGPUVendor()
-	
+	// Every vendor present, not just the first: a workstation can hold an
+	// NVIDIA and an AMD card at once.
+	vendors := detectGPUVendors()
+
 	return &GPUCollector{
-		vendor:           vendor,
+		vendors:          vendors,
 		samplingInterval: time.Duration(samplingIntervalMs) * time.Millisecond,
 		samples:          make([]GPUSample, 0, 1000),
 		stopChan:         make(chan struct{}),
@@ -122,13 +125,13 @@ func NewGPUCollector(samplingIntervalMs int) *GPUCollector {
 
 // Start begins collecting GPU metrics
 func (c *GPUCollector) Start(ctx context.Context) {
-	if c.vendor == GPUVendorUnknown {
+	if len(c.vendors) == 0 {
 		log.Println("⚠️  No GPU detected or unsupported GPU vendor")
 		return
 	}
-	
+
 	go c.collectLoop(ctx)
-	log.Printf("🎮 GPU metrics collector started (vendor: %s, interval: %v)", c.vendor, c.samplingInterval)
+	log.Printf("🎮 GPU metrics collector started (vendors: %v, interval: %v)", c.vendors, c.samplingInterval)
 }
 
 // Stop stops collection and returns metrics
@@ -168,186 +171,188 @@ func (c *GPUCollector) collectLoop(ctx context.Context) {
 	}
 }
 
-// collectSample collects GPU metrics based on vendor
+// collectSample collects one sample from every vendor present.
+//
+// A vendor that fails is reported and skipped rather than aborting the sample:
+// on a mixed machine, a missing rocm-smi must not cost the NVIDIA readings.
 func (c *GPUCollector) collectSample() error {
-	var samples []GPUSample
-	var err error
-	
-	switch c.vendor {
-	case GPUVendorNVIDIA:
-		samples, err = c.collectNVIDIA()
-	case GPUVendorAMD:
-		samples, err = c.collectAMD()
-	case GPUVendorApple:
-		samples, err = c.collectApple()
-	default:
-		return fmt.Errorf("unsupported GPU vendor: %s", c.vendor)
+	var collected []GPUSample
+	var failures []string
+
+	for _, vendor := range c.vendors {
+		var (
+			samples []GPUSample
+			err     error
+		)
+		switch vendor {
+		case GPUVendorNVIDIA:
+			samples, err = c.collectNVIDIA()
+		case GPUVendorAMD:
+			samples, err = c.collectAMD()
+		case GPUVendorApple:
+			samples, err = c.collectApple()
+		default:
+			continue
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", vendor, err))
+			continue
+		}
+		collected = append(collected, samples...)
 	}
-	
-	if err != nil {
-		return err
+
+	c.samples = append(c.samples, collected...)
+
+	if len(failures) > 0 && len(collected) == 0 {
+		return fmt.Errorf("every GPU vendor failed to report (%s)", strings.Join(failures, "; "))
 	}
-	
-	c.samples = append(c.samples, samples...)
+	for _, failure := range failures {
+		log.Printf("⚠️  GPU vendor did not report this sample (%s)", failure)
+	}
 	return nil
 }
 
-// collectNVIDIA collects metrics from NVIDIA GPUs using nvidia-smi
+// nvidiaQueryFields is the exact --query-gpu list the parser expects, in order.
+const nvidiaQueryFields = "index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks.gr,clocks.mem"
+
+// collectNVIDIA samples NVIDIA GPUs through nvidia-smi.
 func (c *GPUCollector) collectNVIDIA() ([]GPUSample, error) {
-	// nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks.gr,clocks.mem --format=csv,noheader,nounits
-	cmd := exec.Command("nvidia-smi",
-		"--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks.gr,clocks.mem",
+	output, err := runVendorTool("nvidia-smi",
+		"--query-gpu="+nvidiaQueryFields,
 		"--format=csv,noheader,nounits",
 	)
-	
-	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("nvidia-smi failed: %w", err)
 	}
-	
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	return parseNVIDIACSV(output, time.Now())
+}
+
+// parseNVIDIACSV reads the CSV that nvidia-smi emits for nvidiaQueryFields with
+// --format=csv,noheader,nounits.
+//
+// A row that does not hold every field is skipped rather than partially read:
+// nvidia-smi prints "[N/A]" for unsupported counters on some cards, and a
+// half-parsed row would look like a real measurement.
+func parseNVIDIACSV(output []byte, now time.Time) ([]GPUSample, error) {
+	text := strings.TrimSpace(string(output))
+	if text == "" {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
 	samples := make([]GPUSample, 0, len(lines))
-	now := time.Now()
-	
+
 	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
 		fields := strings.Split(line, ",")
 		if len(fields) < 11 {
 			continue
 		}
-		
+
+		number := func(index int) (float64, bool) {
+			value, err := strconv.ParseFloat(strings.TrimSpace(fields[index]), 64)
+			if err != nil {
+				return 0, false
+			}
+			return value, true
+		}
+
+		deviceID, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		if err != nil {
+			continue
+		}
+
 		sample := GPUSample{
 			Timestamp:  now,
 			Vendor:     GPUVendorNVIDIA,
+			DeviceID:   deviceID,
+			DeviceName: strings.TrimSpace(fields[1]),
 		}
-		
-		// Parse fields
-		sample.DeviceID, _ = strconv.Atoi(strings.TrimSpace(fields[0]))
-		sample.DeviceName = strings.TrimSpace(fields[1])
-		sample.GPUUtilization, _ = strconv.ParseFloat(strings.TrimSpace(fields[2]), 64)
-		sample.MemoryUtilization, _ = strconv.ParseFloat(strings.TrimSpace(fields[3]), 64)
-		sample.MemoryUsedMB, _ = strconv.ParseFloat(strings.TrimSpace(fields[4]), 64)
-		sample.MemoryTotalMB, _ = strconv.ParseFloat(strings.TrimSpace(fields[5]), 64)
-		sample.TemperatureC, _ = strconv.ParseFloat(strings.TrimSpace(fields[6]), 64)
-		sample.PowerUsageW, _ = strconv.ParseFloat(strings.TrimSpace(fields[7]), 64)
-		sample.PowerLimitW, _ = strconv.ParseFloat(strings.TrimSpace(fields[8]), 64)
-		sample.ClockSpeedMHz, _ = strconv.Atoi(strings.TrimSpace(fields[9]))
-		sample.MemoryClockMHz, _ = strconv.Atoi(strings.TrimSpace(fields[10]))
-		sample.ComputeUtilization = sample.GPUUtilization // Approximation
-		
+		sample.GPUUtilization, _ = number(2)
+		sample.MemoryUtilization, _ = number(3)
+		sample.MemoryUsedMB, _ = number(4)
+		sample.MemoryTotalMB, _ = number(5)
+		sample.TemperatureC, _ = number(6)
+		sample.PowerUsageW, _ = number(7)
+		sample.PowerLimitW, _ = number(8)
+		if clock, ok := number(9); ok {
+			sample.ClockSpeedMHz = int(clock)
+		}
+		if clock, ok := number(10); ok {
+			sample.MemoryClockMHz = int(clock)
+		}
+		// nvidia-smi reports no separate compute figure; utilization.gpu is
+		// the closest thing it exposes.
+		sample.ComputeUtilization = sample.GPUUtilization
+
 		samples = append(samples, sample)
 	}
-	
+
 	return samples, nil
 }
 
-// collectAMD collects metrics from AMD GPUs using rocm-smi
-func (c *GPUCollector) collectAMD() ([]GPUSample, error) {
-	// rocm-smi --showid --showproductname --showuse --showmemuse --showtemp --showpower
-	cmd := exec.Command("rocm-smi", "--json")
-	
-	_, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("rocm-smi failed: %w", err)
-	}
-	
-	// TODO: Parse JSON output from rocm-smi
-	// For now, return placeholder
-	log.Println("⚠️  AMD GPU metrics parsing not fully implemented")
-	
-	now := time.Now()
-	return []GPUSample{
-		{
-			Timestamp:  now,
-			DeviceID:   0,
-			Vendor:     GPUVendorAMD,
-			DeviceName: "AMD GPU (placeholder)",
-		},
-	}, nil
-}
+func detectGPUVendors() []GPUVendor {
+	vendors := []GPUVendor{}
 
-// collectApple collects metrics from Apple Silicon GPUs
-func (c *GPUCollector) collectApple() ([]GPUSample, error) {
-	// Apple Silicon: use powermetrics or ioreg
-	// Note: This requires root/sudo access
-	cmd := exec.Command("ioreg", "-r", "-c", "IOAccelerator")
-	
-	_, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ioreg failed: %w", err)
-	}
-	
-	// TODO: Parse ioreg output for GPU metrics
-	// For now, return placeholder
-	log.Println("⚠️  Apple GPU metrics parsing not fully implemented")
-	
-	now := time.Now()
-	return []GPUSample{
-		{
-			Timestamp:  now,
-			DeviceID:   0,
-			Vendor:     GPUVendorApple,
-			DeviceName: "Apple Silicon GPU (placeholder)",
-		},
-	}, nil
-}
-
-// detectGPUVendor detects which GPU vendor is present
-func detectGPUVendor() GPUVendor {
-	// Try NVIDIA
 	if _, err := exec.LookPath("nvidia-smi"); err == nil {
-		return GPUVendorNVIDIA
+		vendors = append(vendors, GPUVendorNVIDIA)
 	}
-	
-	// Try AMD
-	if _, err := exec.LookPath("rocm-smi"); err == nil {
-		return GPUVendorAMD
+	_, amdSMIErr := exec.LookPath("amd-smi")
+	_, rocmSMIErr := exec.LookPath("rocm-smi")
+	if amdSMIErr == nil || rocmSMIErr == nil {
+		vendors = append(vendors, GPUVendorAMD)
 	}
-	
-	// Try Apple Silicon (check if running on macOS with Apple Silicon)
 	if _, err := exec.LookPath("ioreg"); err == nil {
-		// Additional check for Apple Silicon
-		cmd := exec.Command("sysctl", "-n", "machdep.cpu.brand_string")
-		if output, err := cmd.Output(); err == nil {
+		if output, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
 			if strings.Contains(string(output), "Apple") {
-				return GPUVendorApple
+				vendors = append(vendors, GPUVendorApple)
 			}
 		}
 	}
-	
-	return GPUVendorUnknown
+
+	return vendors
+}
+
+// deviceKey namespaces a device by vendor: NVIDIA and AMD both index from 0.
+func deviceKey(vendor GPUVendor, deviceID int) string {
+	return fmt.Sprintf("%s:%d", vendor, deviceID)
 }
 
 // getGPUCount returns the number of GPUs detected
 func (c *GPUCollector) getGPUCount() int {
-	deviceIDs := make(map[int]bool)
+	devices := make(map[string]bool)
 	for _, sample := range c.samples {
-		deviceIDs[sample.DeviceID] = true
+		devices[deviceKey(sample.Vendor, sample.DeviceID)] = true
 	}
-	return len(deviceIDs)
+	return len(devices)
 }
 
 // ComputeGPUAggregates calculates aggregate GPU statistics
 func ComputeGPUAggregates(timeSeries *GPUTimeSeries) *GPUAggregates {
 	if len(timeSeries.Samples) == 0 {
 		return &GPUAggregates{
-			PerGPU: make(map[int]GPUDeviceAggregates),
+			PerGPU: make(map[string]GPUDeviceAggregates),
 		}
 	}
 	
-	// Group samples by device ID
-	perDevice := make(map[int][]GPUSample)
+	// Group by vendor and device: two vendors in one machine both start
+	// numbering at zero, so a bare device id would merge their samples.
+	perDevice := make(map[string][]GPUSample)
 	for _, sample := range timeSeries.Samples {
-		perDevice[sample.DeviceID] = append(perDevice[sample.DeviceID], sample)
+		key := deviceKey(sample.Vendor, sample.DeviceID)
+		perDevice[key] = append(perDevice[key], sample)
 	}
 	
 	agg := &GPUAggregates{
-		PerGPU: make(map[int]GPUDeviceAggregates),
+		PerGPU: make(map[string]GPUDeviceAggregates),
 	}
 	
 	// Compute per-device aggregates
-	for deviceID, samples := range perDevice {
-		deviceAgg := computeDeviceAggregates(deviceID, samples)
-		agg.PerGPU[deviceID] = deviceAgg
+	for key, samples := range perDevice {
+		deviceAgg := computeDeviceAggregates(samples[0].DeviceID, samples)
+		agg.PerGPU[key] = deviceAgg
 		
 		// Add to overall aggregates
 		agg.TotalMemoryUsedMB += deviceAgg.MemoryUsedMaxMB

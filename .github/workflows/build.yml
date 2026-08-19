@@ -42,10 +42,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          RUNNER_UPDATE_PUBLIC_KEY: ${{ secrets.RUNNER_UPDATE_PUBLIC_KEY }}
         run: |
+          test -n "$RUNNER_UPDATE_PUBLIC_KEY" || { echo "RUNNER_UPDATE_PUBLIC_KEY is required"; exit 1; }
           BINARY_NAME="dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}"
           go build \
-            -ldflags "-s -w -X dragrace/internal/version.Version=${{ steps.version.outputs.version }}" \
+            -ldflags "-s -w -X dragrace/internal/version.Version=${{ steps.version.outputs.version }} -X dragrace/internal/updater.embeddedUpdatePublicKeyB64=${RUNNER_UPDATE_PUBLIC_KEY}" \
             -o "dist/${BINARY_NAME}" \
             ./cmd/runner/
           chmod +x "dist/${BINARY_NAME}"
@@ -73,6 +75,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: repo
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: repo/go.mod
+
+      - name: Sign release artifacts
+        env:
+          RUNNER_UPDATE_SIGNING_KEY: ${{ secrets.RUNNER_UPDATE_SIGNING_KEY }}
+          RUNNER_UPDATE_PUBLIC_KEY: ${{ secrets.RUNNER_UPDATE_PUBLIC_KEY }}
+        working-directory: repo
+        run: go run ./cmd/sign-update ../dist/dragrace-runner-*
 
       - name: Create or update GitHub Release
         env:

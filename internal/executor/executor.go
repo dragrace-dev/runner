@@ -14,7 +14,7 @@ type Executor interface {
 
 	// RunMeasured executes a script and collects metrics during execution.
 	// Each executor owns its metrics strategy internally.
-	RunMeasured(ctx context.Context, opts *RunOptions) (*metrics.RunMetrics, error)
+	RunMeasured(ctx context.Context, opts *RunOptions) (*metrics.RunMetrics, string, error)
 
 	// EnsureDataDir creates the data storage (volume or directory) if it doesn't exist.
 	EnsureDataDir(ctx context.Context, name string) error
@@ -57,13 +57,26 @@ type RunOptions struct {
 
 	// Args are extra positional arguments passed to the script ($@).
 	Args []string
+
+	// NetworkEnabled controls whether the sandbox has network access for
+	// this phase. Defaults to false (safe default: no egress).
+	NetworkEnabled bool
+
+	// Trusted marks phases driven by organizer-controlled configuration
+	// (e.g. challenge init/validate), which may need root to install
+	// challenge dependencies and therefore keep a writable rootfs and the
+	// image's default user. Untrusted phases (solution build/run) default
+	// to false and get the strict sandbox: non-root user, read-only rootfs.
+	Trusted bool
 }
 
 // ResourceLimits defines resource constraints for script execution.
 type ResourceLimits struct {
 	MemoryBytes int64
 	CPUNano     int64
+	DiskBytes   int64
 	Timeout     int // seconds
+	PidsLimit   int // native process-group limit; 0 uses the executor default
 }
 
 // DataDirName generates a unique data directory name for a challenge.

@@ -1,6 +1,10 @@
 module dragrace
 
-go 1.25
+// Patch version pinned on purpose: actions/setup-go resolves a bare "1.25" to
+// whatever patch the hosted runner already caches, which left CI on go1.25.12
+// and the supply-chain gate red on six stdlib advisories fixed in go1.25.13.
+// Bump this line when govulncheck reports a newer stdlib fix.
+go 1.25.13
 
 require (
 	github.com/docker/docker v27.4.1+incompatible

@@ -1,13 +1,35 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+
 	"gopkg.in/yaml.v3"
 )
 
 // ParseChallengeSpec parses YAML content into a ChallengeSpec
 func ParseChallengeSpec(yamlContent []byte) (*ChallengeSpec, error) {
+	if len(yamlContent) > maxYAMLBytes {
+		return nil, fmt.Errorf("challenge YAML exceeds %d-byte limit", maxYAMLBytes)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(yamlContent))
+	var node yaml.Node
+	if err := decoder.Decode(&node); err != nil {
+		return nil, err
+	}
+	if err := validateYAMLNode(&node, 0); err != nil {
+		return nil, fmt.Errorf("unsafe challenge YAML: %w", err)
+	}
 	var spec ChallengeSpec
-	if err := yaml.Unmarshal(yamlContent, &spec); err != nil {
+	if err := decodeStrictNode(&node, &spec); err != nil {
+		return nil, err
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("challenge YAML must contain exactly one document")
+	}
+	if err := ValidateChallengeSpec(&spec); err != nil {
 		return nil, err
 	}
 	return &spec, nil

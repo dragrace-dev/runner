@@ -176,8 +176,8 @@ func TestParseUnifiedFile_EmptyFile(t *testing.T) {
 
 // ── ExtractSolutionFromFile ─────────────────────────────────────────────────
 
-func TestExtractSolution_IgnoresChallenge(t *testing.T) {
-	// Security test: challenge section must be ignored
+func TestExtractSolution_RejectsChallengeDocument(t *testing.T) {
+	// A participant config must never mix in an organizer-controlled document.
 	path := writeTempYAML(t, `
 version: "1.0"
 type: challenge
@@ -199,15 +199,8 @@ run:
   script: "scripts/run.sh"
 `)
 
-	sol, err := ExtractSolutionFromFile(path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if sol == nil {
-		t.Fatal("expected solution, got nil")
-	}
-	if sol.Runtime.Docker != "golang:1.21" {
-		t.Errorf("wrong docker image: %s", sol.Runtime.Docker)
+	if _, err := ExtractSolutionFromFile(path); err == nil {
+		t.Fatal("expected mixed trusted/untrusted YAML to be rejected")
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const maxYAMLBytes = 64 * 1024
+
 // typeHeader is used to peek at the "type" field of a YAML document.
 type typeHeader struct {
 	Type string `yaml:"type"`
@@ -24,6 +26,9 @@ func ParseUnifiedFile(path string) (*ChallengeSpec, *SolutionConfig, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot read %s: %w", path, err)
 	}
+	if len(data) > maxYAMLBytes {
+		return nil, nil, fmt.Errorf("%s: YAML exceeds %d-byte limit", path, maxYAMLBytes)
+	}
 
 	var challenge *ChallengeSpec
 	var solution *SolutionConfig
@@ -38,6 +43,9 @@ func ParseUnifiedFile(path string) (*ChallengeSpec, *SolutionConfig, error) {
 			}
 			return nil, nil, fmt.Errorf("invalid YAML in %s: %w", path, err)
 		}
+		if err := validateYAMLNode(&node, 0); err != nil {
+			return nil, nil, fmt.Errorf("%s: unsafe YAML: %w", path, err)
+		}
 
 		// Peek at the type field.
 		var header typeHeader
@@ -51,7 +59,7 @@ func ParseUnifiedFile(path string) (*ChallengeSpec, *SolutionConfig, error) {
 				return nil, nil, fmt.Errorf("%s: duplicate 'challenge' document", path)
 			}
 			challenge = &ChallengeSpec{}
-			if err := node.Decode(challenge); err != nil {
+			if err := decodeStrictNode(&node, challenge); err != nil {
 				return nil, nil, fmt.Errorf("%s: invalid challenge document: %w", path, err)
 			}
 
@@ -60,7 +68,7 @@ func ParseUnifiedFile(path string) (*ChallengeSpec, *SolutionConfig, error) {
 				return nil, nil, fmt.Errorf("%s: duplicate 'solution' document", path)
 			}
 			solution = &SolutionConfig{}
-			if err := node.Decode(solution); err != nil {
+			if err := decodeStrictNode(&node, solution); err != nil {
 				return nil, nil, fmt.Errorf("%s: invalid solution document: %w", path, err)
 			}
 
@@ -85,6 +93,9 @@ func ExtractSolutionFromFile(path string) (*SolutionConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", path, err)
 	}
+	if len(data) > maxYAMLBytes {
+		return nil, fmt.Errorf("%s: YAML exceeds %d-byte limit", path, maxYAMLBytes)
+	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	for {
@@ -95,6 +106,9 @@ func ExtractSolutionFromFile(path string) (*SolutionConfig, error) {
 			}
 			return nil, fmt.Errorf("invalid YAML in %s: %w", path, err)
 		}
+		if err := validateYAMLNode(&node, 0); err != nil {
+			return nil, fmt.Errorf("%s: unsafe YAML: %w", path, err)
+		}
 
 		var header typeHeader
 		if err := node.Decode(&header); err != nil {
@@ -103,13 +117,54 @@ func ExtractSolutionFromFile(path string) (*SolutionConfig, error) {
 
 		if header.Type == "solution" {
 			sol := &SolutionConfig{}
-			if err := node.Decode(sol); err != nil {
+			if err := decodeStrictNode(&node, sol); err != nil {
+				return nil, fmt.Errorf("%s: invalid solution document: %w", path, err)
+			}
+			if err := ValidateSolutionSpec(sol); err != nil {
 				return nil, fmt.Errorf("%s: invalid solution document: %w", path, err)
 			}
 			return sol, nil
 		}
-		// Silently skip any non-solution documents (including challenge).
+		return nil, fmt.Errorf("%s: untrusted solution config may only contain a 'solution' document", path)
 	}
 
 	return nil, fmt.Errorf("%s: no 'solution' document found", path)
+}
+
+func decodeStrictNode(node *yaml.Node, target any) error {
+	encoded, err := yaml.Marshal(node)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	return decoder.Decode(target)
+}
+
+func validateYAMLNode(node *yaml.Node, depth int) error {
+	if depth > 20 {
+		return fmt.Errorf("maximum nesting depth exceeded")
+	}
+	if node.Kind == yaml.AliasNode || node.Anchor != "" {
+		return fmt.Errorf("anchors and aliases are not allowed")
+	}
+	if node.Kind == yaml.MappingNode {
+		seen := make(map[string]struct{}, len(node.Content)/2)
+		for index := 0; index < len(node.Content); index += 2 {
+			key := node.Content[index]
+			if key.Kind != yaml.ScalarNode {
+				return fmt.Errorf("mapping keys must be scalars")
+			}
+			if _, exists := seen[key.Value]; exists {
+				return fmt.Errorf("duplicate mapping key %q", key.Value)
+			}
+			seen[key.Value] = struct{}{}
+		}
+	}
+	for _, child := range node.Content {
+		if err := validateYAMLNode(child, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }

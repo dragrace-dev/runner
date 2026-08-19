@@ -18,7 +18,7 @@ import (
 )
 
 // Set this at build/release time or override with RUNNER_UPDATE_PUBLIC_KEY (base64 Ed25519 public key).
-const embeddedUpdatePublicKeyB64 = ""
+var embeddedUpdatePublicKeyB64 = ""
 
 func Update(updateURL string) error {
 	if updateURL == "" {
@@ -40,17 +40,6 @@ func Update(updateURL string) error {
 	if err != nil {
 		return fmt.Errorf("failed to download checksum: %w", err)
 	}
-	expectedChecksum, err := parseChecksumLine(string(checksumBody))
-	if err != nil {
-		return fmt.Errorf("invalid checksum file: %w", err)
-	}
-
-	sum := sha256.Sum256(binaryData)
-	actualChecksum := hex.EncodeToString(sum[:])
-	if !strings.EqualFold(actualChecksum, expectedChecksum) {
-		return fmt.Errorf("checksum mismatch")
-	}
-
 	signatureB64, err := downloadBytes(signatureURL)
 	if err != nil {
 		return fmt.Errorf("failed to download signature: %w", err)
@@ -60,13 +49,8 @@ func Update(updateURL string) error {
 	if err != nil {
 		return err
 	}
-	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(signatureB64)))
-	if err != nil {
-		return fmt.Errorf("invalid signature encoding: %w", err)
-	}
-	// Signature is over the checksum hex string to keep the wire format stable.
-	if !ed25519.Verify(pubKey, []byte(strings.ToLower(expectedChecksum)), sig) {
-		return fmt.Errorf("signature verification failed")
+	if err := verifyDownload(binaryData, checksumBody, signatureB64, pubKey); err != nil {
+		return err
 	}
 
 	execPath, err := os.Executable()
@@ -109,6 +93,52 @@ func Update(updateURL string) error {
 	log.Printf("✅ Updated successfully to latest version (was %s)", version.Version)
 	log.Println("🔄 Please restart the runner to use the new version.")
 	return nil
+}
+
+func verifyDownload(binaryData, checksumBody, signatureBody []byte, pubKey ed25519.PublicKey) error {
+	expectedChecksum, err := parseChecksumLine(string(checksumBody))
+	if err != nil {
+		return fmt.Errorf("invalid checksum file: %w", err)
+	}
+
+	sum := sha256.Sum256(binaryData)
+	actualChecksum := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(actualChecksum, expectedChecksum) {
+		return fmt.Errorf("checksum mismatch")
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(signatureBody)))
+	if err != nil {
+		return fmt.Errorf("invalid signature encoding: %w", err)
+	}
+	// Signature is over the checksum hex string to keep the wire format stable.
+	if !ed25519.Verify(pubKey, []byte(strings.ToLower(expectedChecksum)), sig) {
+		return fmt.Errorf("signature verification failed")
+	}
+	return nil
+}
+
+// VerifyArtifactFiles applies the exact checks used by Update to an already
+// downloaded release binary and its sidecars. Release automation uses it as a
+// final gate before publishing assets.
+func VerifyArtifactFiles(binaryPath string) error {
+	binaryData, err := os.ReadFile(binaryPath)
+	if err != nil {
+		return fmt.Errorf("read binary: %w", err)
+	}
+	checksumBody, err := os.ReadFile(binaryPath + ".sha256")
+	if err != nil {
+		return fmt.Errorf("read checksum: %w", err)
+	}
+	signatureBody, err := os.ReadFile(binaryPath + ".sha256.sig")
+	if err != nil {
+		return fmt.Errorf("read signature: %w", err)
+	}
+	publicKey, err := loadUpdatePublicKey()
+	if err != nil {
+		return err
+	}
+	return verifyDownload(binaryData, checksumBody, signatureBody, publicKey)
 }
 
 func downloadBytes(url string) ([]byte, error) {

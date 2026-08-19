@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -14,7 +15,9 @@ import (
 	"dragrace/internal/config"
 	"dragrace/internal/docker"
 	"dragrace/internal/executor"
+	"dragrace/internal/health"
 	"dragrace/internal/jobs"
+	"dragrace/internal/lifecycle"
 	natsclient "dragrace/internal/nats"
 	"dragrace/internal/process"
 	"dragrace/internal/registration"
@@ -41,6 +44,7 @@ func main() {
 	credsFile := flag.StringP("creds", "c", "", "Path to NATS credentials file")
 	backendURL := flag.StringP("backend-url", "b", "", "Backend URL for device flow (overrides BACKEND_URL env)")
 	idleTimeout := flag.IntP("idle-timeout", "i", 0, "Exit after N minutes of no job activity (0 = infinite)")
+	healthAddr := flag.String("health-addr", "", "Local health endpoint listen address (overrides RUNNER_HEALTH_ADDR)")
 	showVersion := flag.BoolP("version", "v", false, "Show version and exit")
 
 	flag.Usage = func() {
@@ -55,12 +59,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
 		fmt.Fprintf(os.Stderr, "  WS_BACKEND_URL        WebSocket backend URL (default: wss://ws.dragrace.dev)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_EXECUTOR       Executor type: docker, process (default: docker)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_NATIVE_RISK_ACCEPTED  Required true for remote process executor\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_ID             Runner identifier (default: runner-default)\n")
 		fmt.Fprintf(os.Stderr, "  BACKEND_URL           Backend HTTP URL for login (default: https://dragrace.dev)\n")
 		fmt.Fprintf(os.Stderr, "  DOCKER_HOST           Docker socket (default: unix:///var/run/docker.sock)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_WORK_DIR       Working directory (default: /var/dragrace)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_UPDATE_URL     Base URL for self-update binaries (default: GitHub releases)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_IDLE_TIMEOUT   Idle timeout in minutes (default: 0 = infinite)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_HEALTH_ADDR    Local health endpoint (default: 127.0.0.1:8081)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_AIRGAPPED      Forbid all sandbox network egress, overriding challenge policy (default: false)\n")
 	}
 	flag.Parse()
 
@@ -85,6 +92,9 @@ func main() {
 	}
 	if *backendURL != "" {
 		cfg.BackendURL = *backendURL
+	}
+	if *healthAddr != "" {
+		cfg.HealthAddr = *healthAddr
 	}
 
 	// Handle subcommands
@@ -125,6 +135,25 @@ func main() {
 	log.Printf("Runner ID: %s", cfg.RunnerID)
 	log.Printf("WS Backend URL: %s", cfg.WsBackendURL)
 	log.Printf("Executor: %s", cfg.Executor)
+	if cfg.Executor == "process" && !cfg.NativeRiskAccepted {
+		log.Fatal("🛑 Native process execution requires RUNNER_NATIVE_RISK_ACCEPTED=true. It runs untrusted code on the host without container isolation.")
+	}
+	if cfg.AirGapped {
+		log.Println("🔒 Air-gapped mode: sandbox network egress is forbidden for all phases")
+	}
+
+	runnerState := lifecycle.New(cfg.RunnerID, version.Version)
+	runnerState.SetStatus(lifecycle.StatusRegistering)
+	healthServer := health.NewServer(cfg.HealthAddr, runnerState)
+	if err := healthServer.Start(); err != nil {
+		log.Fatalf("❌ Failed to start local health endpoint: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = healthServer.Shutdown(ctx)
+	}()
+	log.Printf("🩺 Local health endpoint: http://%s/healthz", cfg.HealthAddr)
 
 	// Initialize NATS client with .creds authentication
 	nc, err := natsclient.NewClient(cfg, resolvedCreds)
@@ -176,6 +205,7 @@ func main() {
 	if backendRunnerID == "" {
 		backendRunnerID = cfg.RunnerID
 	}
+	runnerState.SetRunnerID(backendRunnerID)
 
 	if regResult.Credentials != "" {
 		if err := os.MkdirAll(filepath.Dir(resolvedCreds), 0700); err != nil {
@@ -224,34 +254,56 @@ func main() {
 	defer exec.Close()
 
 	// Initialize job handler
-	handler := jobs.NewHandler(nc, exec, backendRunnerID)
+	handler := jobs.NewHandler(nc, exec, backendRunnerID, runnerState, cfg.AirGapped)
 
 	// Subscribe to job submit topic
 	jobSubject := fmt.Sprintf("dragrace.dev.runner.%s.job.submit", backendRunnerID)
-	_, err = nc.Subscribe(jobSubject, handler.HandleJobSubmit)
+	jobSubscription, err := nc.Subscribe(jobSubject, handler.HandleJobSubmit)
 	if err != nil {
 		log.Fatalf("❌ Failed to subscribe to jobs: %v", err)
 	}
 
 	log.Printf("✅ Subscribed to job submit topic: %s", jobSubject)
 	log.Println("⏳ Waiting for jobs...")
+	runnerState.SetStatus(lifecycle.StatusIdle)
+
+	sendHeartbeat := func() {
+		snapshot := runnerState.Snapshot()
+		status := "idle"
+		var currentJobID *string
+		if snapshot.Status == lifecycle.StatusBusy {
+			status = "busy"
+			jobID := snapshot.CurrentJobID
+			currentJobID = &jobID
+		} else if snapshot.Status == lifecycle.StatusStopping || snapshot.Status == lifecycle.StatusOffline {
+			status = "offline"
+		}
+		err := nc.SendHeartbeat(backendRunnerID, status, currentJobID)
+		runnerState.RecordHeartbeat(err)
+		if err != nil {
+			log.Printf("⚠️  Failed to send heartbeat: %v", err)
+		}
+	}
 
 	// Send initial heartbeat
-	if err := nc.SendHeartbeat(backendRunnerID, "idle", nil); err != nil {
-		log.Printf("⚠️  Failed to send heartbeat: %v", err)
-	}
+	sendHeartbeat()
 	if err := nc.SendRunnerConfig(backendRunnerID, hwInfo); err != nil {
 		log.Printf("⚠️  Failed to send runner config: %v", err)
 	}
 
 	// Start heartbeat ticker
 	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	heartbeatDone := make(chan struct{})
+	heartbeatStopped := make(chan struct{})
 
 	go func() {
-		for range ticker.C {
-			if err := nc.SendHeartbeat(backendRunnerID, "idle", nil); err != nil {
-				log.Printf("⚠️  Failed to send heartbeat: %v", err)
+		defer close(heartbeatStopped)
+		for {
+			select {
+			case <-ticker.C:
+				sendHeartbeat()
+			case <-heartbeatDone:
+				return
 			}
 		}
 	}()
@@ -284,10 +336,22 @@ func main() {
 		log.Println("\n👋 Shutting down gracefully...")
 	}
 
+	if err := jobSubscription.Unsubscribe(); err != nil {
+		log.Printf("⚠️  Failed to unsubscribe from jobs: %v", err)
+	}
+	handler.StopAndWait()
+	runnerState.SetStatus(lifecycle.StatusStopping)
+	ticker.Stop()
+	close(heartbeatDone)
+	<-heartbeatStopped
+
 	// Send goodbye heartbeat so backend knows we're offline immediately
+	runnerState.SetStatus(lifecycle.StatusOffline)
 	if err := nc.SendHeartbeat(backendRunnerID, "offline", nil); err != nil {
+		runnerState.RecordHeartbeat(err)
 		log.Printf("⚠️  Failed to send goodbye heartbeat: %v", err)
 	} else {
+		runnerState.RecordHeartbeat(nil)
 		log.Println("📤 Goodbye heartbeat sent")
 	}
 }

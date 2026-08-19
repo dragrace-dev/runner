@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -23,10 +24,34 @@ type Executor struct {
 	baseDataDir string // Root dir for data volumes (e.g. /var/dragrace/data)
 }
 
+type LimitKind string
+
+const (
+	LimitTimeout       LimitKind = "timeout"
+	LimitMemory        LimitKind = "memory"
+	LimitCPU           LimitKind = "cpu"
+	LimitProcesses     LimitKind = "processes"
+	LimitFilesystem    LimitKind = "filesystem"
+	defaultPids                  = 64
+	defaultBuildMemory           = 512 * 1024 * 1024
+	defaultBuildCPU              = 1_000_000_000
+	defaultBuildDisk             = 10 * 1024 * 1024 * 1024
+)
+
+type LimitError struct {
+	Kind LimitKind
+}
+
+func (e *LimitError) Error() string { return fmt.Sprintf("native executor %s limit exceeded", e.Kind) }
+
 // Compile-time check that Executor implements the interface.
 var _ executor.Executor = (*Executor)(nil)
 
 func NewExecutor(baseDataDir string) (*Executor, error) {
+	if err := validateProcessControls(); err != nil {
+		return nil, err
+	}
+
 	if baseDataDir == "" {
 		baseDataDir = "/var/dragrace/data"
 	}
@@ -53,10 +78,20 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 		return "", err
 	}
 
-	output, err := cmd.CombinedOutput()
-	logs := string(output)
+	var outputBuf strings.Builder
+	cmd.Stdout = &outputBuf
+	cmd.Stderr = &outputBuf
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start process: %w", err)
+	}
+	err = waitForCommand(ctx, cmd, opts.Limits)
+	logs := outputBuf.String()
 
 	if err != nil {
+		var limitErr *LimitError
+		if errors.As(err, &limitErr) {
+			return logs, limitErr
+		}
 		return logs, fmt.Errorf("script failed: %w", err)
 	}
 
@@ -64,12 +99,12 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 }
 
 // RunMeasured executes a script and collects metrics via OS-level tools.
-func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (*metrics.RunMetrics, error) {
+func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (*metrics.RunMetrics, string, error) {
 	log.Printf("🏃 Running script with metrics (process): %s", opts.ScriptPath)
 
 	cmd, err := e.buildCommand(ctx, opts)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Capture output
@@ -79,10 +114,13 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 
 	// If stdout redirect is specified, write to file instead
 	if opts.Stdout != "" {
-		stdoutPath := filepath.Join(opts.RepoDir, opts.Stdout)
-		f, err := os.Create(stdoutPath)
+		stdoutPath, err := safeWritablePath(opts.RepoDir, opts.Stdout)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create stdout file %s: %w", stdoutPath, err)
+			return nil, "", fmt.Errorf("invalid stdout file: %w", err)
+		}
+		f, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to create stdout file %s: %w", stdoutPath, err)
 		}
 		defer f.Close()
 		cmd.Stdout = f
@@ -92,7 +130,7 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 
 	// Start process
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start process: %w", err)
+		return nil, "", fmt.Errorf("failed to start process: %w", err)
 	}
 
 	pid := cmd.Process.Pid
@@ -107,7 +145,7 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 	collector.start(ctx)
 
 	// Wait for process
-	err = cmd.Wait()
+	err = waitForCommand(ctx, cmd, opts.Limits)
 	executionTime := time.Since(startTime)
 
 	// Stop collector
@@ -115,28 +153,40 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 
 	exitCode := 0
 	if err != nil {
+		var limitErr *LimitError
+		if errors.As(err, &limitErr) {
+			// A classified overrun still produced output; #23 persists the logs
+			// of every phase outcome, so hand them back like the paths below.
+			return nil, outputBuf.String(), limitErr
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 			log.Printf("❌ Run phase exited with code %d: %s", exitCode, outputBuf.String())
-			return nil, fmt.Errorf("run script exited with code %d", exitCode)
+			return nil, outputBuf.String(), fmt.Errorf("run script exited with code %d", exitCode)
 		}
-		return nil, fmt.Errorf("run phase error: %w", err)
+		return nil, outputBuf.String(), fmt.Errorf("run phase error: %w", err)
 	}
 
 	runMetrics.Aggregates.ExitCode = exitCode
 	log.Printf("📊 Collected %d samples over %dms", len(runMetrics.TimeSeries.Samples), runMetrics.Aggregates.ExecutionTimeMs)
 
-	return runMetrics, nil
+	return runMetrics, outputBuf.String(), nil
 }
 
 // EnsureDataDir creates a local directory as data storage.
 func (e *Executor) EnsureDataDir(ctx context.Context, name string) error {
+	if !isSafeDataDirName(name) {
+		return fmt.Errorf("invalid data directory name: %s", name)
+	}
 	dir := filepath.Join(e.baseDataDir, name)
 	return os.MkdirAll(dir, 0755)
 }
 
 // DataDirExists checks if the data directory exists.
 func (e *Executor) DataDirExists(ctx context.Context, name string) bool {
+	if !isSafeDataDirName(name) {
+		return false
+	}
 	dir := filepath.Join(e.baseDataDir, name)
 	info, err := os.Stat(dir)
 	return err == nil && info.IsDir()
@@ -144,6 +194,9 @@ func (e *Executor) DataDirExists(ctx context.Context, name string) bool {
 
 // RemoveDataDir removes the data directory.
 func (e *Executor) RemoveDataDir(ctx context.Context, name string) error {
+	if !isSafeDataDirName(name) {
+		return fmt.Errorf("invalid data directory name: %s", name)
+	}
 	dir := filepath.Join(e.baseDataDir, name)
 	return os.RemoveAll(dir)
 }
@@ -153,7 +206,18 @@ func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) 
 	if !isSafeRelativePath(opts.ScriptPath) {
 		return nil, fmt.Errorf("invalid script path: %s", opts.ScriptPath)
 	}
-	scriptPath := filepath.Join(opts.RepoDir, opts.ScriptPath)
+	repoDir, err := filepath.EvalSymlinks(opts.RepoDir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid repository directory: %w", err)
+	}
+	scriptPath, err := filepath.EvalSymlinks(filepath.Join(repoDir, opts.ScriptPath))
+	if err != nil {
+		return nil, fmt.Errorf("script not found: %s", opts.ScriptPath)
+	}
+	relScript, err := filepath.Rel(repoDir, scriptPath)
+	if err != nil || !isSafeRelativePath(relScript) {
+		return nil, fmt.Errorf("script escapes repository: %s", opts.ScriptPath)
+	}
 
 	// Verify script is executable (must be committed with +x in Git)
 	info, err := os.Stat(scriptPath)
@@ -170,27 +234,144 @@ func (e *Executor) buildCommand(ctx context.Context, opts *executor.RunOptions) 
 	}
 
 	// Build shell command with optional args
-	shell := fmt.Sprintf("cd %s && ./%s", shellQuote(opts.RepoDir), shellQuote(opts.ScriptPath))
+	fileBlocks := (diskLimitBytes(opts.Limits) + 511) / 512
+	shell := fmt.Sprintf("ulimit -f %d && cd %s && exec ./%s", fileBlocks, shellQuote(repoDir), shellQuote(relScript))
 	if len(opts.Args) > 0 {
 		for _, arg := range opts.Args {
 			shell += " " + shellQuote(arg)
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shell)
+	cmd := exec.Command("/bin/sh", "-c", shell)
+	configureProcessGroup(cmd)
 
-	// Set up environment with data dir + extra env vars
-	cmd.Env = append(os.Environ(),
+	homeDir := filepath.Join(repoDir, ".dragrace-home")
+	tmpDir := filepath.Join(repoDir, ".dragrace-tmp")
+	if err := os.MkdirAll(homeDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create isolated HOME: %w", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create isolated TMPDIR: %w", err)
+	}
+
+	// Do not expose runner credentials or service secrets to challenge code.
+	cmd.Env = append(safeHostEnvironment(),
 		fmt.Sprintf("DRAGRACE_DATA_DIR=%s", filepath.Join(e.baseDataDir, opts.DataDir)),
-		fmt.Sprintf("DRAGRACE_REPO_DIR=%s", opts.RepoDir),
+		fmt.Sprintf("DRAGRACE_REPO_DIR=%s", repoDir),
+		fmt.Sprintf("HOME=%s", homeDir),
+		fmt.Sprintf("TMPDIR=%s", tmpDir),
 	)
 
 	// Add extra env vars from options
 	for k, v := range opts.Env {
+		if strings.Contains(k, "=") || k == "" {
+			return nil, fmt.Errorf("invalid environment variable name: %q", k)
+		}
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	return cmd, nil
+}
+
+func safeHostEnvironment() []string {
+	allowed := []string{"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"}
+	env := make([]string, 0, len(allowed))
+	for _, key := range allowed {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+func waitForCommand(ctx context.Context, cmd *exec.Cmd, limits *executor.ResourceLimits) error {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	violations, stopMonitor := monitorProcessGroup(cmd.Process.Pid, limits)
+	defer stopMonitor()
+
+	select {
+	case err := <-done:
+		if limitErr := classifyFilesystemExit(err, diskLimitBytes(limits) > 0); limitErr != nil {
+			return limitErr
+		}
+		return err
+	case violation := <-violations:
+		terminateProcessGroup(cmd.Process.Pid)
+		<-done
+		return violation
+	case <-ctx.Done():
+		terminateProcessGroup(cmd.Process.Pid)
+		<-done
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return &LimitError{Kind: LimitTimeout}
+		}
+		return ctx.Err()
+	}
+}
+
+func monitorProcessGroup(pid int, limits *executor.ResourceLimits) (<-chan *LimitError, func()) {
+	violations := make(chan *LimitError, 1)
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopMonitor := func() { stopOnce.Do(func() { close(stop) }) }
+	if limits == nil {
+		limits = &executor.ResourceLimits{
+			MemoryBytes: defaultBuildMemory,
+			CPUNano:     defaultBuildCPU,
+			DiskBytes:   defaultBuildDisk,
+			PidsLimit:   defaultPids,
+		}
+	}
+
+	pidsLimit := limits.PidsLimit
+	if pidsLimit == 0 {
+		pidsLimit = defaultPids
+	}
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		consecutiveCPU := 0
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			usage, err := processGroupUsage(pid)
+			if err != nil || usage.Processes == 0 {
+				continue
+			}
+			if limits.MemoryBytes > 0 && usage.MemoryBytes > limits.MemoryBytes {
+				violations <- &LimitError{Kind: LimitMemory}
+				return
+			}
+			if pidsLimit > 0 && usage.Processes > pidsLimit {
+				violations <- &LimitError{Kind: LimitProcesses}
+				return
+			}
+			if limits.CPUNano > 0 {
+				allowedPercent := float64(limits.CPUNano) / 1_000_000_000 * 100
+				if usage.CPUPercent > allowedPercent*1.25 {
+					consecutiveCPU++
+				} else {
+					consecutiveCPU = 0
+				}
+				if consecutiveCPU >= 8 {
+					violations <- &LimitError{Kind: LimitCPU}
+					return
+				}
+			}
+		}
+	}()
+	return violations, stopMonitor
+}
+
+func diskLimitBytes(limits *executor.ResourceLimits) int64 {
+	if limits != nil && limits.DiskBytes > 0 {
+		return limits.DiskBytes
+	}
+	return defaultBuildDisk
 }
 
 // shellQuote wraps a string in single quotes for safe shell usage.
@@ -204,6 +385,33 @@ func isSafeRelativePath(path string) bool {
 	}
 	clean := filepath.Clean(path)
 	return !strings.HasPrefix(clean, "..") && !filepath.IsAbs(clean)
+}
+
+func isSafeDataDirName(name string) bool {
+	return isSafeRelativePath(name) && filepath.Base(name) == name
+}
+
+func safeWritablePath(repoDir, relativePath string) (string, error) {
+	if !isSafeRelativePath(relativePath) {
+		return "", fmt.Errorf("path must stay inside repository")
+	}
+	repo, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(repo, filepath.Clean(relativePath))
+	parent, err := filepath.EvalSymlinks(filepath.Dir(target))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(repo, parent)
+	if err != nil || (!isSafeRelativePath(rel) && rel != ".") {
+		return "", fmt.Errorf("parent directory escapes repository")
+	}
+	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("symbolic-link output is forbidden")
+	}
+	return target, nil
 }
 
 // ── Process Metrics Collector ──────────────────────────────────────────────

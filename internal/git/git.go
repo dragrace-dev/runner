@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,8 +18,8 @@ func Clone(url, ref, destDir string) error {
 
 	// Try shallow clone with branch/tag first
 	cmd := exec.Command("git", "clone", "--depth", "1", "--branch", ref, url, destDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
 
 	if err := cmd.Run(); err != nil {
 		// If branch/tag clone fails, it might be a commit hash
@@ -36,8 +37,8 @@ func cloneWithCommit(url, commitHash, destDir string) error {
 
 	// Clone without depth restriction (needed for arbitrary commit)
 	cloneCmd := exec.Command("git", "clone", url, destDir)
-	cloneCmd.Stdout = os.Stdout
-	cloneCmd.Stderr = os.Stderr
+	cloneCmd.Stdout = io.Discard
+	cloneCmd.Stderr = io.Discard
 
 	if err := cloneCmd.Run(); err != nil {
 		return fmt.Errorf("failed to clone repository: %w", err)
@@ -46,11 +47,11 @@ func cloneWithCommit(url, commitHash, destDir string) error {
 	// Checkout the specific commit
 	checkoutCmd := exec.Command("git", "checkout", commitHash)
 	checkoutCmd.Dir = destDir
-	checkoutCmd.Stdout = os.Stdout
-	checkoutCmd.Stderr = os.Stderr
+	checkoutCmd.Stdout = io.Discard
+	checkoutCmd.Stderr = io.Discard
 
 	if err := checkoutCmd.Run(); err != nil {
-		return fmt.Errorf("failed to checkout commit %s: %w", commitHash, err)
+		return fmt.Errorf("failed to checkout requested commit: %w", err)
 	}
 
 	return nil
@@ -64,7 +65,7 @@ func CloneShallow(url, ref, destDir string) error {
 		"--single-branch",
 		"--branch", ref,
 		url, destDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
 	return cmd.Run()
 }

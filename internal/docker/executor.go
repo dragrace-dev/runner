@@ -14,12 +14,27 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // Executor implements executor.Executor using Docker containers.
 type Executor struct {
 	client *client.Client
 }
+
+// Baseline resource ceilings per phase, applied when a challenge sets no
+// explicit limits.yaml values. The build phase is a compile/setup step and
+// stays modest; the run phase is generous by default because that's where
+// measured solutions execute. Both are scaled down to fit the actual host
+// in resolveResources — see #58: a hardcoded 8-CPU run default made every
+// host with fewer cores fail to start a measured run at all.
+const (
+	defaultBuildMemory = 512 * 1024 * 1024 // 512MB
+	defaultBuildCPU    = 1_000_000_000     // 1 CPU
+
+	defaultRunMemory = 32 * 1024 * 1024 * 1024 // 32GB
+	defaultRunCPU    = 8_000_000_000           // 8 CPUs
+)
 
 // Compile-time check that Executor implements the interface.
 var _ executor.Executor = (*Executor)(nil)
@@ -73,47 +88,32 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
-	binds := []string{
-		fmt.Sprintf("%s:/workspace:ro", opts.RepoDir),
-	}
+	binds := buildBinds(opts)
 
-	if opts.DataDir != "" {
-		mode := "rw"
-		if opts.ReadOnlyData {
-			mode = "ro"
-		}
-		binds = append(binds, fmt.Sprintf("%s:/data:%s", opts.DataDir, mode))
-	}
-
-	// Configure resources
-	resources := container.Resources{
-		Memory:   512 * 1024 * 1024, // Default 512MB
-		NanoCPUs: 1000000000,        // Default 1 CPU
-	}
-	if opts.Limits != nil {
-		if opts.Limits.MemoryBytes > 0 {
-			resources.Memory = opts.Limits.MemoryBytes
-		}
-		if opts.Limits.CPUNano > 0 {
-			resources.NanoCPUs = opts.Limits.CPUNano
-		}
+	// Configure resources, sized to what this host can actually run (#58).
+	resources, err := e.resolveResources(ctx, opts, defaultBuildMemory, defaultBuildCPU)
+	if err != nil {
+		return "", err
 	}
 
 	// Build env vars
 	env := buildDockerEnv(opts)
 
-	// Create container
-	resp, err := e.client.ContainerCreate(ctx, &container.Config{
+	containerCfg := &container.Config{
 		Image:      opts.Image,
 		Cmd:        cmd,
 		Env:        env,
 		Tty:        false,
 		WorkingDir: "/workspace",
-	}, &container.HostConfig{
-		Binds:       binds,
-		Resources:   resources,
-		NetworkMode: "bridge", // Network enabled for init/build/validate (download deps, data, etc.)
-	}, nil, nil, "")
+		Labels:     sandboxLabels,
+	}
+	hostCfg := baseHostConfig(binds, resources, opts.NetworkEnabled)
+	if !opts.Trusted {
+		hardenSandbox(containerCfg, hostCfg)
+	}
+
+	// Create container
+	resp, err := e.client.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("failed to create container: %w", err)
 	}
@@ -166,72 +166,73 @@ func (e *Executor) RunContainer(ctx context.Context, imageName string, cmd []str
 
 // RunMeasured executes a script and collects metrics during execution.
 // Owns the full lifecycle: create → start → collect metrics → wait → cleanup.
-func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (*metrics.RunMetrics, error) {
+// This runs solution-controlled code, so it always applies the strict
+// sandbox (non-root, read-only rootfs) on top of the baseline hardening.
+func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (*metrics.RunMetrics, string, error) {
 	log.Printf("🏃 Running script with metrics: %s in %s", opts.ScriptPath, opts.Image)
 
 	// Pull image
 	reader, err := e.client.ImagePull(ctx, opts.Image, image.PullOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to pull image %s: %w", opts.Image, err)
+		return nil, "", fmt.Errorf("failed to pull image %s: %w", opts.Image, err)
 	}
 	defer reader.Close()
 	io.Copy(io.Discard, reader)
+
+	// The run phase is non-root; a writable data dir (only used by local
+	// `runner test` runs) needs to be handed over to that user first, since
+	// Docker always creates named volumes root-owned.
+	if opts.DataDir != "" && !opts.ReadOnlyData {
+		if err := e.chownDataDir(ctx, opts.Image, opts.DataDir); err != nil {
+			return nil, "", fmt.Errorf("failed to prepare data dir: %w", err)
+		}
+	}
 
 	// Build command with optional args
 	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
-	binds := []string{
-		fmt.Sprintf("%s:/workspace:ro", opts.RepoDir),
-	}
-	if opts.DataDir != "" {
-		mode := "rw"
-		if opts.ReadOnlyData {
-			mode = "ro"
-		}
-		binds = append(binds, fmt.Sprintf("%s:/data:%s", opts.DataDir, mode))
-	}
+	binds := buildBinds(opts)
 
-	// Configure resources
-	resources := container.Resources{
-		Memory:   32 * 1024 * 1024 * 1024, // 32GB default for run phase
-		NanoCPUs: 8 * 1000000000,          // 8 CPUs default
-	}
-	if opts.Limits != nil {
-		if opts.Limits.MemoryBytes > 0 {
-			resources.Memory = opts.Limits.MemoryBytes
-		}
-		if opts.Limits.CPUNano > 0 {
-			resources.NanoCPUs = opts.Limits.CPUNano
-		}
+	// Configure resources, sized to what this host can actually run (#58).
+	resources, err := e.resolveResources(ctx, opts, defaultRunMemory, defaultRunCPU)
+	if err != nil {
+		return nil, "", err
 	}
 
 	// Build env vars
 	env := buildDockerEnv(opts)
 
-	// Create container
-	resp, err := e.client.ContainerCreate(ctx, &container.Config{
+	containerCfg := &container.Config{
 		Image:      opts.Image,
 		Cmd:        cmd,
 		Env:        env,
 		Tty:        false,
 		WorkingDir: "/workspace",
-	}, &container.HostConfig{
-		Binds:       binds,
-		Resources:   resources,
-		NetworkMode: "none", // Network disabled for measured run (fairness + security)
-	}, nil, nil, "")
+		Labels:     sandboxLabels,
+	}
+	hostCfg := baseHostConfig(binds, resources, opts.NetworkEnabled)
+	hardenSandbox(containerCfg, hostCfg)
+
+	// Create container
+	resp, err := e.client.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create container: %w", err)
+		return nil, "", fmt.Errorf("failed to create container: %w", err)
 	}
 
 	containerID := resp.ID
 	log.Printf("   Container created: %s (measuring metrics)", containerID[:12])
 
+	// Ensure cleanup even if a future change adds an early return below.
+	defer func() {
+		if err := e.client.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true}); err != nil {
+			log.Printf("⚠️  Failed to remove container: %v", err)
+		}
+	}()
+
 	// Start container
 	if err := e.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		e.client.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true})
-		return nil, fmt.Errorf("failed to start container: %w", err)
+		return nil, "", fmt.Errorf("failed to start container: %w", err)
 	}
 
 	// Start metrics collector
@@ -244,25 +245,20 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 	// Stop metrics collector
 	runMetrics := collector.Stop()
 
-	// Cleanup container
-	if cleanupErr := e.client.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true}); cleanupErr != nil {
-		log.Printf("⚠️  Failed to remove container: %v", cleanupErr)
-	}
-
 	if err != nil {
 		log.Printf("❌ Run phase error: %s", logs)
-		return nil, err
+		return nil, logs, err
 	}
 
 	if exitCode != 0 {
 		log.Printf("❌ Run phase exited with code %d: %s", exitCode, logs)
-		return nil, fmt.Errorf("run script exited with code %d", exitCode)
+		return nil, logs, fmt.Errorf("run script exited with code %d", exitCode)
 	}
 
 	runMetrics.Aggregates.ExitCode = int(exitCode)
 	log.Printf("📊 Collected %d samples over %dms", len(runMetrics.TimeSeries.Samples), runMetrics.Aggregates.ExecutionTimeMs)
 
-	return runMetrics, nil
+	return runMetrics, logs, nil
 }
 
 // waitContainer waits for a container to finish and returns the exit code and logs.
@@ -300,12 +296,13 @@ func (e *Executor) getContainerLogs(ctx context.Context, containerID string) (st
 	}
 	defer reader.Close()
 
-	output, err := io.ReadAll(reader)
+	var output strings.Builder
+	_, err = stdcopy.StdCopy(&output, &output, reader)
 	if err != nil {
 		return "", fmt.Errorf("failed to read container logs: %w", err)
 	}
 
-	return string(output), nil
+	return output.String(), nil
 }
 
 // buildDockerCmd constructs the shell command for a container, including optional args.
@@ -372,4 +369,64 @@ func isSafeRelativePath(path string) bool {
 	}
 	clean := filepath.Clean(path)
 	return !strings.HasPrefix(clean, "..") && !filepath.IsAbs(clean)
+}
+
+// hostCapacity returns the Docker daemon's reported CPU and memory
+// capacity. This is what the daemon itself validates NanoCPUs against
+// (rejecting anything above host NCPU), so querying it first lets the
+// runner catch an unsatisfiable request with its own clear error instead
+// of surfacing Docker's raw one.
+func (e *Executor) hostCapacity(ctx context.Context) (nanoCPUs int64, memBytes int64, err error) {
+	info, err := e.client.Info(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to query Docker host capacity: %w", err)
+	}
+	if info.NCPU <= 0 {
+		return 0, 0, fmt.Errorf("docker host reported no usable CPUs")
+	}
+	return int64(info.NCPU) * 1_000_000_000, info.MemTotal, nil
+}
+
+// resolveResources builds the container.Resources for a phase from its
+// baseline defaults, the host's actual capacity, and any explicit
+// challenge-supplied request (#58).
+func (e *Executor) resolveResources(ctx context.Context, opts *executor.RunOptions, defaultMemory, defaultCPU int64) (container.Resources, error) {
+	hostCPU, hostMem, err := e.hostCapacity(ctx)
+	if err != nil {
+		return container.Resources{}, err
+	}
+	return clampResourcesToHost(container.Resources{Memory: defaultMemory, NanoCPUs: defaultCPU}, opts, hostCPU, hostMem)
+}
+
+// clampResourcesToHost layers opts.Limits on top of the phase defaults and
+// fits the result to the host: a default that overshoots is silently
+// scaled down (so a modest host can still run a phase that set no
+// explicit limits), but an explicit challenge request that overshoots is
+// rejected outright rather than handed to Docker to fail on.
+func clampResourcesToHost(defaults container.Resources, opts *executor.RunOptions, hostNanoCPUs, hostMemBytes int64) (container.Resources, error) {
+	resources := defaults
+
+	if opts.Limits != nil && opts.Limits.CPUNano > 0 {
+		if opts.Limits.CPUNano > hostNanoCPUs {
+			return container.Resources{}, fmt.Errorf(
+				"requested cpu limit (%.2f CPUs) exceeds host capacity (%.2f CPUs)",
+				float64(opts.Limits.CPUNano)/1e9, float64(hostNanoCPUs)/1e9)
+		}
+		resources.NanoCPUs = opts.Limits.CPUNano
+	} else if resources.NanoCPUs > hostNanoCPUs {
+		resources.NanoCPUs = hostNanoCPUs
+	}
+
+	if opts.Limits != nil && opts.Limits.MemoryBytes > 0 {
+		if hostMemBytes > 0 && opts.Limits.MemoryBytes > hostMemBytes {
+			return container.Resources{}, fmt.Errorf(
+				"requested memory limit (%d bytes) exceeds host capacity (%d bytes)",
+				opts.Limits.MemoryBytes, hostMemBytes)
+		}
+		resources.Memory = opts.Limits.MemoryBytes
+	} else if hostMemBytes > 0 && resources.Memory > hostMemBytes {
+		resources.Memory = hostMemBytes
+	}
+
+	return resources, nil
 }

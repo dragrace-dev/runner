@@ -1,0 +1,119 @@
+package docker
+
+import (
+	"strings"
+	"testing"
+
+	"dragrace/internal/executor"
+
+	"github.com/docker/docker/api/types/container"
+)
+
+// These are the threat-model checks for task #20: every sandbox container
+// must drop all capabilities, block privilege escalation, cap its process
+// count, follow the network policy it was given (never hardcoded), and
+// mount only the two paths a phase actually needs.
+
+func TestBaseHostConfigDropsAllCapabilitiesAndBlocksPrivilegeEscalation(t *testing.T) {
+	hostCfg := baseHostConfig(nil, container.Resources{}, false)
+
+	if len(hostCfg.CapDrop) != 1 || hostCfg.CapDrop[0] != "ALL" {
+		t.Fatalf("expected CapDrop: [ALL], got %v", hostCfg.CapDrop)
+	}
+	if len(hostCfg.CapAdd) != 0 {
+		t.Fatalf("expected no capabilities added back, got %v", hostCfg.CapAdd)
+	}
+	found := false
+	for _, opt := range hostCfg.SecurityOpt {
+		if opt == "no-new-privileges:true" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected no-new-privileges:true in SecurityOpt, got %v", hostCfg.SecurityOpt)
+	}
+}
+
+func TestBaseHostConfigCapsProcessCount(t *testing.T) {
+	hostCfg := baseHostConfig(nil, container.Resources{}, false)
+
+	if hostCfg.Resources.PidsLimit == nil {
+		t.Fatal("expected a PIDs limit to be set")
+	}
+	if *hostCfg.Resources.PidsLimit <= 0 {
+		t.Fatalf("expected a positive PIDs limit, got %d", *hostCfg.Resources.PidsLimit)
+	}
+}
+
+func TestBaseHostConfigNetworkModeFollowsPolicy(t *testing.T) {
+	cases := []struct {
+		networkEnabled bool
+		want           container.NetworkMode
+	}{
+		{networkEnabled: false, want: container.NetworkMode("none")},
+		{networkEnabled: true, want: container.NetworkMode("bridge")},
+	}
+	for _, tc := range cases {
+		hostCfg := baseHostConfig(nil, container.Resources{}, tc.networkEnabled)
+		if hostCfg.NetworkMode != tc.want {
+			t.Errorf("networkEnabled=%v: expected NetworkMode %q, got %q", tc.networkEnabled, tc.want, hostCfg.NetworkMode)
+		}
+	}
+}
+
+func TestBaseHostConfigPreservesCallerResourceLimits(t *testing.T) {
+	resources := container.Resources{Memory: 123, NanoCPUs: 456}
+	hostCfg := baseHostConfig(nil, resources, false)
+
+	if hostCfg.Resources.Memory != 123 || hostCfg.Resources.NanoCPUs != 456 {
+		t.Fatalf("expected caller resource limits to survive, got %#v", hostCfg.Resources)
+	}
+}
+
+func TestHardenSandboxSetsNonRootUserAndReadOnlyRootfs(t *testing.T) {
+	cfg := &container.Config{}
+	hostCfg := &container.HostConfig{}
+	hardenSandbox(cfg, hostCfg)
+
+	if cfg.User == "" || cfg.User == "0" || cfg.User == "0:0" || strings.HasPrefix(cfg.User, "root") {
+		t.Fatalf("expected a non-root user, got %q", cfg.User)
+	}
+	if !hostCfg.ReadonlyRootfs {
+		t.Fatal("expected ReadonlyRootfs to be true")
+	}
+	tmpfsOpts, ok := hostCfg.Tmpfs["/tmp"]
+	if !ok {
+		t.Fatal("expected a tmpfs mount at /tmp so scripts have scratch space under a read-only rootfs")
+	}
+	if !strings.Contains(tmpfsOpts, "size=") {
+		t.Fatalf("expected the /tmp tmpfs to have a bounded size, got %q", tmpfsOpts)
+	}
+}
+
+func TestBuildBindsWorkspaceIsAlwaysReadOnly(t *testing.T) {
+	binds := buildBinds(&executor.RunOptions{RepoDir: "/host/repo"})
+	if len(binds) != 1 || binds[0] != "/host/repo:/workspace:ro" {
+		t.Fatalf("expected a single read-only workspace bind, got %v", binds)
+	}
+}
+
+func TestBuildBindsDataDirModeFollowsReadOnlyFlag(t *testing.T) {
+	rw := buildBinds(&executor.RunOptions{RepoDir: "/host/repo", DataDir: "vol", ReadOnlyData: false})
+	if rw[1] != "vol:/data:rw" {
+		t.Fatalf("expected a writable data bind, got %v", rw)
+	}
+
+	ro := buildBinds(&executor.RunOptions{RepoDir: "/host/repo", DataDir: "vol", ReadOnlyData: true})
+	if ro[1] != "vol:/data:ro" {
+		t.Fatalf("expected a read-only data bind, got %v", ro)
+	}
+}
+
+func TestBuildBindsOmitsDataMountWhenNoDataDir(t *testing.T) {
+	binds := buildBinds(&executor.RunOptions{RepoDir: "/host/repo"})
+	for _, b := range binds {
+		if strings.Contains(b, "/data") {
+			t.Fatalf("expected no /data mount when DataDir is unset, got %v", binds)
+		}
+	}
+}

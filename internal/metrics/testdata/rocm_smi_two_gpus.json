@@ -1,0 +1,30 @@
+{
+  "card0": {
+    "Card Series": "AMD Instinct MI210",
+    "GPU use (%)": "87",
+    "GPU Memory Allocated (VRAM%)": "25",
+    "GPU Memory Read/Write Activity (%)": "61",
+    "VRAM Total Memory (B)": "68719476736",
+    "VRAM Total Used Memory (B)": "17179869184",
+    "Temperature (Sensor edge) (C)": "64.0",
+    "Temperature (Sensor junction) (C)": "73.0",
+    "Average Graphics Package Power (W)": "215.5",
+    "Max Graphics Package Power (W)": "300.0",
+    "sclk clock speed:": "(1700Mhz)",
+    "mclk clock speed:": "(1600Mhz)"
+  },
+  "card1": {
+    "Card Series": "AMD Radeon PRO W6800",
+    "GPU use (%)": "12",
+    "GPU Memory Allocated (VRAM%)": "N/A",
+    "VRAM Total Memory (B)": "34359738368",
+    "VRAM Total Used Memory (B)": "2147483648",
+    "Temperature (Sensor junction) (C)": "72.0",
+    "Average Graphics Package Power (W)": "N/A (Secondary die)",
+    "sclk clock speed:": "(900Mhz)",
+    "mclk clock speed:": "(1000Mhz)"
+  },
+  "system": {
+    "AMDGPU version": "6.4.0"
+  }
+}

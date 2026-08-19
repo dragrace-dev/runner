@@ -1,0 +1,42 @@
+[
+  {
+    "gpu": 0,
+    "usage": {
+      "gfx_activity": {"value": 91, "unit": "%"}
+    },
+    "mem_usage": {
+      "total_vram": {"value": 65536, "unit": "MB"},
+      "used_vram": {"value": 24576, "unit": "MB"}
+    },
+    "power": {
+      "socket_power": {"value": 228.75, "unit": "W"}
+    },
+    "temperature": {
+      "edge": {"value": 63, "unit": "C"},
+      "hotspot": {"value": 74, "unit": "C"}
+    },
+    "clock": {
+      "gfx_0": {"clk": {"value": 1725, "unit": "MHz"}},
+      "mem_0": {"clk": {"value": 1600, "unit": "MHz"}}
+    }
+  },
+  {
+    "gpu": 1,
+    "usage": {
+      "gfx_activity": {"value": 17, "unit": "%"}
+    },
+    "mem_usage": {
+      "total_vram": {"value": 34359738368, "unit": "B"},
+      "used_vram": {"value": 8589934592, "unit": "B"}
+    },
+    "power": {"socket_power": "N/A"},
+    "temperature": {
+      "edge": "N/A",
+      "hotspot": {"value": 70, "unit": "C"}
+    },
+    "clock": {
+      "gfx_0": {"clk": "N/A"},
+      "mem_0": {"clk": {"value": 1100, "unit": "MHz"}}
+    }
+  }
+]

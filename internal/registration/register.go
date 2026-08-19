@@ -33,6 +33,7 @@ type RegisterRequest struct {
 	Hostname      string                 `json:"hostname,omitempty"`
 	HardwareInfo  map[string]interface{} `json:"hardware_info,omitempty"`
 	RunnerVersion string                 `json:"runner_version,omitempty"`
+	ExecutorType  string                 `json:"executor_type"`
 }
 
 // Register sends a registration message to the backend and returns the result.
@@ -44,6 +45,7 @@ func Register(nc *nats.Conn, cfg *config.Config, hwInfo *system.HardwareInfo) (*
 		Fingerprint:   hwInfo.Fingerprint,
 		Hostname:      hwInfo.Hostname,
 		RunnerVersion: version.Version,
+		ExecutorType:  cfg.Executor,
 	}
 
 	// Convert hardware info to a map

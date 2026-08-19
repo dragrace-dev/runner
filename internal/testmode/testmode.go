@@ -169,13 +169,15 @@ func Run(opts *Options) error {
 
 			start := time.Now()
 			logs, err := exec.RunScript(ctx, &executor.RunOptions{
-				Image:        image,
-				ScriptPath:   challengeSpec.Init.Script,
-				RepoDir:      challengeDir,
-				DataDir:      volumeName,
-				ReadOnlyData: false,
-				Env:          opts.Env,
-				Args:         opts.Args,
+				Image:          image,
+				ScriptPath:     challengeSpec.Init.Script,
+				RepoDir:        challengeDir,
+				DataDir:        volumeName,
+				ReadOnlyData:   false,
+				Env:            opts.Env,
+				Args:           opts.Args,
+				NetworkEnabled: true,
+				Trusted:        true, // organizer-controlled: may need root to install challenge deps
 			})
 			elapsed := time.Since(start)
 
@@ -211,13 +213,15 @@ func Run(opts *Options) error {
 
 		start := time.Now()
 		logs, err := exec.RunScript(ctx, &executor.RunOptions{
-			Image:        image,
-			ScriptPath:   solutionSpec.Build.Script,
-			RepoDir:      solutionDir,
-			DataDir:      volumeName,
-			ReadOnlyData: true,
-			Env:          opts.Env,
-			Args:         opts.Args,
+			Image:          image,
+			ScriptPath:     solutionSpec.Build.Script,
+			RepoDir:        solutionDir,
+			DataDir:        volumeName,
+			ReadOnlyData:   true,
+			Env:            opts.Env,
+			Args:           opts.Args,
+			NetworkEnabled: true,
+			// Trusted defaults to false: solution-controlled code gets the strict sandbox.
 		})
 		elapsed := time.Since(start)
 
@@ -254,19 +258,22 @@ func Run(opts *Options) error {
 			log.Printf("  ⚠️  Failed to parse limits, using defaults: %v", err)
 			parsedLimits = &config.ParsedLimits{}
 		}
+		parsedLimits = config.ClampToRunnerCaps(parsedLimits, false)
 
-		runMetrics, err := exec.RunMeasured(ctx, &executor.RunOptions{
-			Image:        image,
-			ScriptPath:   solutionSpec.Run.Script,
-			RepoDir:      solutionDir,
-			DataDir:      volumeName,
-			ReadOnlyData: false, // Solution needs to write output to /data
-			Stdout:       solutionSpec.Run.Stdout,
-			Env:          opts.Env,
-			Args:         opts.Args,
+		runMetrics, _, err := exec.RunMeasured(ctx, &executor.RunOptions{
+			Image:          image,
+			ScriptPath:     solutionSpec.Run.Script,
+			RepoDir:        solutionDir,
+			DataDir:        volumeName,
+			ReadOnlyData:   false, // Solution needs to write output to /data
+			Stdout:         solutionSpec.Run.Stdout,
+			Env:            opts.Env,
+			Args:           opts.Args,
+			NetworkEnabled: parsedLimits.NetworkEnabled,
 			Limits: &executor.ResourceLimits{
 				MemoryBytes: parsedLimits.MemoryBytes,
-				CPUNano:     parsedLimits.CPUShares * 1_000_000,
+				CPUNano:     parsedLimits.CPUNano,
+				DiskBytes:   parsedLimits.DiskBytes,
 			},
 		})
 		if err != nil {
@@ -304,13 +311,15 @@ func Run(opts *Options) error {
 		}
 
 		logs, err := exec.RunScript(ctx, &executor.RunOptions{
-			Image:        image,
-			ScriptPath:   challengeSpec.Validate.Script,
-			RepoDir:      validateRepoDir,
-			DataDir:      volumeName,
-			ReadOnlyData: true,
-			Env:          opts.Env,
-			Args:         opts.Args,
+			Image:          image,
+			ScriptPath:     challengeSpec.Validate.Script,
+			RepoDir:        validateRepoDir,
+			DataDir:        volumeName,
+			ReadOnlyData:   true,
+			Env:            opts.Env,
+			Args:           opts.Args,
+			NetworkEnabled: true,
+			Trusted:        true, // organizer-controlled validation tooling
 		})
 
 		if err != nil {

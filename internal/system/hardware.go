@@ -47,6 +47,10 @@ type GPUInfo struct {
 	Vendor       string `json:"vendor"`        // nvidia, amd, apple
 	Model        string `json:"model"`
 	MemoryMB     int    `json:"memory_mb"`
+	// Shader/compute core count. The discriminating capability figure on Apple
+	// Silicon, where unified memory leaves no VRAM to compare a Pro against a
+	// Max. 0 when the vendor does not report it.
+	CoreCount    int    `json:"core_count,omitempty"`
 	Driver       string `json:"driver"`
 	PCIBusID     string `json:"pci_bus_id"`
 }
@@ -306,12 +310,6 @@ func detectNVIDIAGPUs() []GPUInfo {
 	return gpus
 }
 
-// detectAMDGPUs detects AMD GPUs using rocm-smi
-func detectAMDGPUs() []GPUInfo {
-	// TODO: Implement AMD GPU detection via rocm-smi
-	return nil
-}
-
 // detectAppleGPU detects Apple Silicon GPU
 func detectAppleGPU() *GPUInfo {
 	if runtime.GOOS != "darwin" {
@@ -324,15 +322,22 @@ func detectAppleGPU() *GPUInfo {
 	if err != nil || !strings.Contains(string(output), "Apple") {
 		return nil
 	}
-	
-	return &GPUInfo{
-		DeviceID: 0,
-		Vendor:   "apple",
-		Model:    "Apple Silicon GPU",
-		MemoryMB: 0, // Shared memory with RAM
-		Driver:   "Metal",
-		PCIBusID: "integrated",
+
+	profile, err := exec.Command("system_profiler", "-json", "SPDisplaysDataType").Output()
+	if err != nil {
+		log.Printf("⚠️  system_profiler unavailable, GPU reported without model or core count: %v", err)
+		return &GPUInfo{DeviceID: 0, Vendor: "apple", Model: "Apple Silicon GPU", Driver: "Metal", PCIBusID: "integrated"}
 	}
+
+	gpu, err := parseAppleGPUProfile(profile)
+	if err != nil {
+		log.Printf("⚠️  could not read the Apple GPU profile: %v", err)
+		return &GPUInfo{DeviceID: 0, Vendor: "apple", Model: "Apple Silicon GPU", Driver: "Metal", PCIBusID: "integrated"}
+	}
+	if gpu == nil {
+		return nil
+	}
+	return gpu
 }
 
 // calculateFingerprint creates a SHA256 hash of critical hardware config
@@ -348,9 +353,11 @@ func calculateFingerprint(info *HardwareInfo) string {
 		info.MemoryTotalGB,
 	)
 	
-	// Add GPU fingerprints
+	// Add GPU fingerprints. Core count is part of the identity: on Apple
+	// Silicon it is the only thing separating a Pro from a Max, both of which
+	// report no VRAM at all.
 	for _, gpu := range info.GPUs {
-		data += fmt.Sprintf("|%s:%s:%d", gpu.Vendor, gpu.Model, gpu.MemoryMB)
+		data += fmt.Sprintf("|%s:%s:%d:%d", gpu.Vendor, gpu.Model, gpu.MemoryMB, gpu.CoreCount)
 	}
 	
 	hash := sha256.Sum256([]byte(data))
