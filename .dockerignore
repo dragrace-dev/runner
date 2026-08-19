@@ -1,0 +1,6 @@
+# The build context is this directory, so keep out what the image never needs.
+# Excluding the Dockerfile itself also keeps `COPY . .` from invalidating the
+# build cache whenever only the recipe changes.
+.dockerignore
+Dockerfile
+.github/

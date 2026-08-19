@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,33 +24,33 @@ const (
 // GPUSample represents GPU metrics at a point in time for a single GPU
 type GPUSample struct {
 	Timestamp time.Time `json:"timestamp"`
-	
+
 	// GPU identification
-	DeviceID    int       `json:"device_id"`     // GPU index (0, 1, 2...)
-	Vendor      GPUVendor `json:"vendor"`        // nvidia, amd, apple
-	DeviceName  string    `json:"device_name"`   // e.g., "NVIDIA GeForce RTX 4090"
-	
+	DeviceID   int       `json:"device_id"`   // GPU index (0, 1, 2...)
+	Vendor     GPUVendor `json:"vendor"`      // nvidia, amd, apple
+	DeviceName string    `json:"device_name"` // e.g., "NVIDIA GeForce RTX 4090"
+
 	// Utilization (0-100%)
-	GPUUtilization     float64 `json:"gpu_utilization"`      // GPU core usage
-	MemoryUtilization  float64 `json:"memory_utilization"`   // VRAM usage %
-	
+	GPUUtilization    float64 `json:"gpu_utilization"`    // GPU core usage
+	MemoryUtilization float64 `json:"memory_utilization"` // VRAM usage %
+
 	// Memory (in MB)
-	MemoryUsedMB       float64 `json:"memory_used_mb"`
-	MemoryTotalMB      float64 `json:"memory_total_mb"`
-	
+	MemoryUsedMB  float64 `json:"memory_used_mb"`
+	MemoryTotalMB float64 `json:"memory_total_mb"`
+
 	// Temperature (Celsius)
-	TemperatureC       float64 `json:"temperature_c"`
-	
+	TemperatureC float64 `json:"temperature_c"`
+
 	// Power (Watts)
-	PowerUsageW        float64 `json:"power_usage_w"`
-	PowerLimitW        float64 `json:"power_limit_w"`
-	
+	PowerUsageW float64 `json:"power_usage_w"`
+	PowerLimitW float64 `json:"power_limit_w"`
+
 	// Clock speeds (MHz)
-	ClockSpeedMHz      int     `json:"clock_speed_mhz"`      // GPU core clock
-	MemoryClockMHz     int     `json:"memory_clock_mhz"`     // Memory clock
-	
+	ClockSpeedMHz  int `json:"clock_speed_mhz"`  // GPU core clock
+	MemoryClockMHz int `json:"memory_clock_mhz"` // Memory clock
+
 	// Compute (for ML workloads)
-	ComputeUtilization float64 `json:"compute_utilization"`  // CUDA/ROCm/Metal compute %
+	ComputeUtilization float64 `json:"compute_utilization"` // CUDA/ROCm/Metal compute %
 }
 
 // GPUTimeSeries contains all GPU samples for all GPUs
@@ -65,35 +66,41 @@ type GPUAggregates struct {
 	// collide on a machine holding both an NVIDIA and an AMD card, which both
 	// number their devices from zero.
 	PerGPU map[string]GPUDeviceAggregates `json:"per_gpu"`
-	
+
+	// MeasuredDevices lists, sorted, the same "vendor:device_id" keys as
+	// PerGPU. It exists so a consumer of the result can verify which GPUs
+	// were measured explicitly (#67), rather than inferring it from map
+	// membership.
+	MeasuredDevices []string `json:"measured_devices"`
+
 	// Overall aggregates (across all GPUs)
-	TotalMemoryUsedMB     float64 `json:"total_memory_used_mb"`
+	TotalMemoryUsedMB      float64 `json:"total_memory_used_mb"`
 	TotalMemoryAvailableMB float64 `json:"total_memory_available_mb"`
-	AvgGPUUtilization     float64 `json:"avg_gpu_utilization"`
-	MaxGPUUtilization     float64 `json:"max_gpu_utilization"`
-	AvgTemperature        float64 `json:"avg_temperature"`
-	MaxTemperature        float64 `json:"max_temperature"`
-	TotalPowerUsageW      float64 `json:"total_power_usage_w"`
+	AvgGPUUtilization      float64 `json:"avg_gpu_utilization"`
+	MaxGPUUtilization      float64 `json:"max_gpu_utilization"`
+	AvgTemperature         float64 `json:"avg_temperature"`
+	MaxTemperature         float64 `json:"max_temperature"`
+	TotalPowerUsageW       float64 `json:"total_power_usage_w"`
 }
 
 // GPUDeviceAggregates contains statistics for a single GPU
 type GPUDeviceAggregates struct {
-	DeviceID              int       `json:"device_id"`
-	DeviceName            string    `json:"device_name"`
-	Vendor                GPUVendor `json:"vendor"`
-	
-	GPUUtilizationAvg     float64   `json:"gpu_utilization_avg"`
-	GPUUtilizationMax     float64   `json:"gpu_utilization_max"`
-	
-	MemoryUsedAvgMB       float64   `json:"memory_used_avg_mb"`
-	MemoryUsedMaxMB       float64   `json:"memory_used_max_mb"`
-	MemoryTotalMB         float64   `json:"memory_total_mb"`
-	
-	TemperatureAvgC       float64   `json:"temperature_avg_c"`
-	TemperatureMaxC       float64   `json:"temperature_max_c"`
-	
-	PowerUsageAvgW        float64   `json:"power_usage_avg_w"`
-	PowerUsageMaxW        float64   `json:"power_usage_max_w"`
+	DeviceID   int       `json:"device_id"`
+	DeviceName string    `json:"device_name"`
+	Vendor     GPUVendor `json:"vendor"`
+
+	GPUUtilizationAvg float64 `json:"gpu_utilization_avg"`
+	GPUUtilizationMax float64 `json:"gpu_utilization_max"`
+
+	MemoryUsedAvgMB float64 `json:"memory_used_avg_mb"`
+	MemoryUsedMaxMB float64 `json:"memory_used_max_mb"`
+	MemoryTotalMB   float64 `json:"memory_total_mb"`
+
+	TemperatureAvgC float64 `json:"temperature_avg_c"`
+	TemperatureMaxC float64 `json:"temperature_max_c"`
+
+	PowerUsageAvgW float64 `json:"power_usage_avg_w"`
+	PowerUsageMaxW float64 `json:"power_usage_max_w"`
 }
 
 // GPUCollector collects GPU metrics
@@ -110,7 +117,7 @@ func NewGPUCollector(samplingIntervalMs int) *GPUCollector {
 	if samplingIntervalMs <= 0 {
 		samplingIntervalMs = 100
 	}
-	
+
 	// Every vendor present, not just the first: a workstation can hold an
 	// NVIDIA and an AMD card at once.
 	vendors := detectGPUVendors()
@@ -140,11 +147,11 @@ func (c *GPUCollector) Stop() *GPUTimeSeries {
 		close(c.stopChan)
 		c.stopped = true
 	}
-	
+
 	time.Sleep(50 * time.Millisecond)
-	
+
 	gpuCount := c.getGPUCount()
-	
+
 	return &GPUTimeSeries{
 		Samples:          c.samples,
 		GPUCount:         gpuCount,
@@ -156,7 +163,7 @@ func (c *GPUCollector) Stop() *GPUTimeSeries {
 func (c *GPUCollector) collectLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.samplingInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-c.stopChan:
@@ -333,10 +340,11 @@ func (c *GPUCollector) getGPUCount() int {
 func ComputeGPUAggregates(timeSeries *GPUTimeSeries) *GPUAggregates {
 	if len(timeSeries.Samples) == 0 {
 		return &GPUAggregates{
-			PerGPU: make(map[string]GPUDeviceAggregates),
+			PerGPU:          make(map[string]GPUDeviceAggregates),
+			MeasuredDevices: []string{},
 		}
 	}
-	
+
 	// Group by vendor and device: two vendors in one machine both start
 	// numbering at zero, so a bare device id would merge their samples.
 	perDevice := make(map[string][]GPUSample)
@@ -344,16 +352,16 @@ func ComputeGPUAggregates(timeSeries *GPUTimeSeries) *GPUAggregates {
 		key := deviceKey(sample.Vendor, sample.DeviceID)
 		perDevice[key] = append(perDevice[key], sample)
 	}
-	
+
 	agg := &GPUAggregates{
 		PerGPU: make(map[string]GPUDeviceAggregates),
 	}
-	
+
 	// Compute per-device aggregates
 	for key, samples := range perDevice {
 		deviceAgg := computeDeviceAggregates(samples[0].DeviceID, samples)
 		agg.PerGPU[key] = deviceAgg
-		
+
 		// Add to overall aggregates
 		agg.TotalMemoryUsedMB += deviceAgg.MemoryUsedMaxMB
 		agg.TotalMemoryAvailableMB += deviceAgg.MemoryTotalMB
@@ -367,15 +375,60 @@ func ComputeGPUAggregates(timeSeries *GPUTimeSeries) *GPUAggregates {
 		}
 		agg.TotalPowerUsageW += deviceAgg.PowerUsageAvgW
 	}
-	
+
 	// Average across GPUs
 	gpuCount := float64(len(perDevice))
 	if gpuCount > 0 {
 		agg.AvgGPUUtilization /= gpuCount
 		agg.AvgTemperature /= gpuCount
 	}
-	
+
+	agg.MeasuredDevices = make([]string, 0, len(perDevice))
+	for key := range perDevice {
+		agg.MeasuredDevices = append(agg.MeasuredDevices, key)
+	}
+	sort.Strings(agg.MeasuredDevices)
+
 	return agg
+}
+
+// AllocatedGPUAggregates computes GPU aggregates restricted to the samples
+// the allocated predicate accepts (#67).
+//
+// The collector samples every GPU visible to the runner process itself
+// (nvidia-smi/rocm-smi/ioreg run on the host, not inside the job's
+// container, and there is no way to scope that invocation to one
+// container's view of the hardware). Filtering therefore happens here,
+// after collection, against whatever policy actually governs what the job's
+// container was allowed to see — not what it asked for. Two jobs whose
+// containers were granted distinct cards get disjoint filtered sample sets,
+// and therefore disjoint aggregates, by construction.
+//
+// Returns nil, not an empty aggregate, when no sample is attributable: a job
+// with no GPU allocated (allocated never returns true) must produce no GPU
+// aggregate at all, so a consumer of the result cannot mistake "measured,
+// found idle" for "never measured". The same nil result also covers the
+// degenerate case where a GPU was allocated but sampling produced nothing
+// usable for it — there is nothing to report either way.
+func AllocatedGPUAggregates(series *GPUTimeSeries, allocated func(vendor GPUVendor, deviceID int) bool) *GPUAggregates {
+	if series == nil || allocated == nil {
+		return nil
+	}
+
+	filtered := make([]GPUSample, 0, len(series.Samples))
+	for _, sample := range series.Samples {
+		if allocated(sample.Vendor, sample.DeviceID) {
+			filtered = append(filtered, sample)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	return ComputeGPUAggregates(&GPUTimeSeries{
+		Samples:          filtered,
+		SamplingInterval: series.SamplingInterval,
+	})
 }
 
 // computeDeviceAggregates computes aggregates for a single GPU
@@ -383,48 +436,48 @@ func computeDeviceAggregates(deviceID int, samples []GPUSample) GPUDeviceAggrega
 	if len(samples) == 0 {
 		return GPUDeviceAggregates{DeviceID: deviceID}
 	}
-	
+
 	agg := GPUDeviceAggregates{
-		DeviceID:   deviceID,
-		DeviceName: samples[0].DeviceName,
-		Vendor:     samples[0].Vendor,
+		DeviceID:      deviceID,
+		DeviceName:    samples[0].DeviceName,
+		Vendor:        samples[0].Vendor,
 		MemoryTotalMB: samples[0].MemoryTotalMB,
 	}
-	
+
 	var gpuUtilSum, memUsedSum, tempSum, powerSum float64
-	
+
 	for _, sample := range samples {
 		// GPU utilization
 		if sample.GPUUtilization > agg.GPUUtilizationMax {
 			agg.GPUUtilizationMax = sample.GPUUtilization
 		}
 		gpuUtilSum += sample.GPUUtilization
-		
+
 		// Memory
 		if sample.MemoryUsedMB > agg.MemoryUsedMaxMB {
 			agg.MemoryUsedMaxMB = sample.MemoryUsedMB
 		}
 		memUsedSum += sample.MemoryUsedMB
-		
+
 		// Temperature
 		if sample.TemperatureC > agg.TemperatureMaxC {
 			agg.TemperatureMaxC = sample.TemperatureC
 		}
 		tempSum += sample.TemperatureC
-		
+
 		// Power
 		if sample.PowerUsageW > agg.PowerUsageMaxW {
 			agg.PowerUsageMaxW = sample.PowerUsageW
 		}
 		powerSum += sample.PowerUsageW
 	}
-	
+
 	// Compute averages
 	sampleCount := float64(len(samples))
 	agg.GPUUtilizationAvg = gpuUtilSum / sampleCount
 	agg.MemoryUsedAvgMB = memUsedSum / sampleCount
 	agg.TemperatureAvgC = tempSum / sampleCount
 	agg.PowerUsageAvgW = powerSum / sampleCount
-	
+
 	return agg
 }

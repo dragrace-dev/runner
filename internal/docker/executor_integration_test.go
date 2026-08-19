@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"dragrace/internal/executor"
+	"dragrace/internal/gpu"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -35,7 +36,7 @@ func requireDocker(t *testing.T) *Executor {
 	}
 	cli.Close()
 
-	exec, err := NewExecutor("")
+	exec, err := NewExecutor("", gpu.Policy{})
 	if err != nil {
 		t.Skipf("failed to build docker executor: %v", err)
 	}
@@ -209,5 +210,44 @@ func TestRunScriptTrustedPhaseKeepsWritableRootfsAndRoot(t *testing.T) {
 	logs, err := exec.RunScript(ctx, &executor.RunOptions{Image: sandboxTestImage, ScriptPath: "run.sh", RepoDir: dir, Trusted: true})
 	if err != nil {
 		t.Fatalf("expected the trusted phase to keep a writable rootfs, got error: %v (%s)", err, strings.TrimSpace(logs))
+	}
+}
+
+// A repository path the daemon cannot resolve must fail loudly at container
+// creation instead of producing an empty /workspace.
+//
+// This is the regression guard for #68. When the runner itself runs in a
+// container and drives the host daemon through a mounted socket
+// (docker-out-of-docker), the repo path it hands over exists only inside the
+// runner container. Expressed as a legacy Bind, the daemon would helpfully
+// create that directory on its own host, mount the empty result, and the
+// phase would die on the "script is not executable" pre-check with exit 126
+// — blaming the submitted solution for a deployment problem. Expressed as a
+// bind Mount without CreateMountpoint, the daemon refuses outright and names
+// the path it could not find.
+//
+// The unresolvable path is simulated here with a directory that exists on
+// neither side, which is the same condition the daemon sees in the DooD case.
+func TestRunMeasuredRejectsARepoPathTheDaemonCannotResolve(t *testing.T) {
+	exec := requireDocker(t)
+
+	missing := filepath.Join(t.TempDir(), "never-created", "solution")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, _, err := exec.RunMeasured(ctx, &executor.RunOptions{
+		Image:      sandboxTestImage,
+		ScriptPath: "run.sh",
+		RepoDir:    missing,
+	})
+	if err == nil {
+		t.Fatal("expected an unresolvable repo path to fail container creation, got success — the daemon silently mounted an empty /workspace")
+	}
+	if strings.Contains(err.Error(), "exit") && strings.Contains(err.Error(), "126") {
+		t.Fatalf("expected a mount error naming the missing path, got the misleading exit-126 symptom instead: %v", err)
+	}
+	if _, statErr := os.Stat(missing); statErr == nil {
+		t.Fatalf("the daemon created %s instead of refusing the mount; missing bind sources must never be conjured", missing)
 	}
 }

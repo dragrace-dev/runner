@@ -7,6 +7,7 @@ import (
 	"dragrace/internal/executor"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 )
 
 // These are the threat-model checks for task #20: every sandbox container
@@ -15,7 +16,7 @@ import (
 // mount only the two paths a phase actually needs.
 
 func TestBaseHostConfigDropsAllCapabilitiesAndBlocksPrivilegeEscalation(t *testing.T) {
-	hostCfg := baseHostConfig(nil, container.Resources{}, false)
+	hostCfg := baseHostConfig(nil, nil, container.Resources{}, false)
 
 	if len(hostCfg.CapDrop) != 1 || hostCfg.CapDrop[0] != "ALL" {
 		t.Fatalf("expected CapDrop: [ALL], got %v", hostCfg.CapDrop)
@@ -35,7 +36,7 @@ func TestBaseHostConfigDropsAllCapabilitiesAndBlocksPrivilegeEscalation(t *testi
 }
 
 func TestBaseHostConfigCapsProcessCount(t *testing.T) {
-	hostCfg := baseHostConfig(nil, container.Resources{}, false)
+	hostCfg := baseHostConfig(nil, nil, container.Resources{}, false)
 
 	if hostCfg.Resources.PidsLimit == nil {
 		t.Fatal("expected a PIDs limit to be set")
@@ -54,7 +55,7 @@ func TestBaseHostConfigNetworkModeFollowsPolicy(t *testing.T) {
 		{networkEnabled: true, want: container.NetworkMode("bridge")},
 	}
 	for _, tc := range cases {
-		hostCfg := baseHostConfig(nil, container.Resources{}, tc.networkEnabled)
+		hostCfg := baseHostConfig(nil, nil, container.Resources{}, tc.networkEnabled)
 		if hostCfg.NetworkMode != tc.want {
 			t.Errorf("networkEnabled=%v: expected NetworkMode %q, got %q", tc.networkEnabled, tc.want, hostCfg.NetworkMode)
 		}
@@ -63,7 +64,7 @@ func TestBaseHostConfigNetworkModeFollowsPolicy(t *testing.T) {
 
 func TestBaseHostConfigPreservesCallerResourceLimits(t *testing.T) {
 	resources := container.Resources{Memory: 123, NanoCPUs: 456}
-	hostCfg := baseHostConfig(nil, resources, false)
+	hostCfg := baseHostConfig(nil, nil, resources, false)
 
 	if hostCfg.Resources.Memory != 123 || hostCfg.Resources.NanoCPUs != 456 {
 		t.Fatalf("expected caller resource limits to survive, got %#v", hostCfg.Resources)
@@ -90,21 +91,43 @@ func TestHardenSandboxSetsNonRootUserAndReadOnlyRootfs(t *testing.T) {
 	}
 }
 
-func TestBuildBindsWorkspaceIsAlwaysReadOnly(t *testing.T) {
-	binds := buildBinds(&executor.RunOptions{RepoDir: "/host/repo"})
-	if len(binds) != 1 || binds[0] != "/host/repo:/workspace:ro" {
-		t.Fatalf("expected a single read-only workspace bind, got %v", binds)
+func TestBuildMountsWorkspaceIsAlwaysReadOnly(t *testing.T) {
+	mounts := buildMounts(&executor.RunOptions{RepoDir: "/host/repo"})
+	if len(mounts) != 1 {
+		t.Fatalf("expected a single workspace mount, got %v", mounts)
+	}
+	got := mounts[0]
+	if got.Type != mount.TypeBind || got.Source != "/host/repo" || got.Target != "/workspace" {
+		t.Fatalf("expected /host/repo bind-mounted at /workspace, got %+v", got)
+	}
+	if !got.ReadOnly {
+		t.Fatalf("expected the workspace mount to be read-only, got %+v", got)
+	}
+}
+
+// The repository mount must never ask the daemon to conjure its source
+// directory. When the runner is containerized and drives the host daemon
+// over a mounted socket (docker-out-of-docker), the repo path exists only
+// inside the runner container; letting the daemon create it there yields an
+// empty /workspace and a misleading exit 126 from the "script is not
+// executable" pre-check. Refusing to create it turns that into an explicit
+// "bind source path does not exist" at container creation. See #68.
+func TestBuildMountsNeverCreatesMissingSourceOnTheDaemonHost(t *testing.T) {
+	mounts := buildMounts(&executor.RunOptions{RepoDir: "/host/repo"})
+	opts := mounts[0].BindOptions
+	if opts != nil && opts.CreateMountpoint {
+		t.Fatal("workspace mount must not set CreateMountpoint: a source the daemon cannot see has to be an error, not an empty directory")
 	}
 }
 
 func TestBuildBindsDataDirModeFollowsReadOnlyFlag(t *testing.T) {
 	rw := buildBinds(&executor.RunOptions{RepoDir: "/host/repo", DataDir: "vol", ReadOnlyData: false})
-	if rw[1] != "vol:/data:rw" {
+	if len(rw) != 1 || rw[0] != "vol:/data:rw" {
 		t.Fatalf("expected a writable data bind, got %v", rw)
 	}
 
 	ro := buildBinds(&executor.RunOptions{RepoDir: "/host/repo", DataDir: "vol", ReadOnlyData: true})
-	if ro[1] != "vol:/data:ro" {
+	if len(ro) != 1 || ro[0] != "vol:/data:ro" {
 		t.Fatalf("expected a read-only data bind, got %v", ro)
 	}
 }
@@ -114,6 +137,17 @@ func TestBuildBindsOmitsDataMountWhenNoDataDir(t *testing.T) {
 	for _, b := range binds {
 		if strings.Contains(b, "/data") {
 			t.Fatalf("expected no /data mount when DataDir is unset, got %v", binds)
+		}
+	}
+}
+
+// The repository travels as a path and the data dir as a named volume, so
+// only the repository is exposed to daemon-side path resolution.
+func TestBuildBindsCarriesNoWorkspacePath(t *testing.T) {
+	binds := buildBinds(&executor.RunOptions{RepoDir: "/host/repo", DataDir: "vol"})
+	for _, b := range binds {
+		if strings.Contains(b, "/workspace") || strings.Contains(b, "/host/repo") {
+			t.Fatalf("the workspace must travel as a Mount, not a Bind, got %v", binds)
 		}
 	}
 }

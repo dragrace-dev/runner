@@ -7,6 +7,7 @@ import (
 	"dragrace/internal/executor"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 )
 
 const (
@@ -33,28 +34,54 @@ const (
 
 var sandboxLabels = map[string]string{sandboxLabel: "true"}
 
-// buildBinds constructs the minimal set of bind mounts for a phase:
-// the repository (always read-only) and, if requested, the challenge data
-// volume (read-only unless the phase explicitly needs to write to it).
+// buildMounts constructs the repository mount for a phase.
+//
+// The repository is always read-only, and always expressed as an explicit
+// bind Mount rather than a legacy Bind string. That distinction is load
+// bearing: the daemon silently creates a missing source directory for a
+// Bind, but rejects a missing source for a bind Mount that does not opt
+// into CreateMountpoint. Since the daemon resolves this path in its own
+// filesystem namespace, a runner that is itself containerized and talks to
+// the host daemon over a mounted socket (docker-out-of-docker) hands over a
+// path that only exists inside the runner container. With a Bind that
+// mismatch is invisible: /workspace arrives empty and the phase dies on the
+// "script is not executable" pre-check with exit 126, pointing the operator
+// at the solution instead of at their deployment. With a Mount the daemon
+// answers "bind source path does not exist: <path>", which names the actual
+// problem. See docs/ENV_CONFIGURATION.md for how to make the path agree on
+// both sides.
+func buildMounts(opts *executor.RunOptions) []mount.Mount {
+	return []mount.Mount{{
+		Type:     mount.TypeBind,
+		Source:   opts.RepoDir,
+		Target:   "/workspace",
+		ReadOnly: true,
+		// BindOptions is deliberately left nil: no CreateMountpoint, so a
+		// source the daemon cannot see is an error rather than an empty
+		// directory conjured on the daemon host.
+	}}
+}
+
+// buildBinds constructs the challenge data mount for a phase, if requested.
+// DataDir is a named volume rather than a path, so it is namespace agnostic
+// and stays a plain Bind: it resolves identically whoever the daemon is.
+// It is read-only unless the phase explicitly needs to write to it.
 func buildBinds(opts *executor.RunOptions) []string {
-	binds := []string{
-		fmt.Sprintf("%s:/workspace:ro", opts.RepoDir),
+	if opts.DataDir == "" {
+		return nil
 	}
-	if opts.DataDir != "" {
-		mode := "rw"
-		if opts.ReadOnlyData {
-			mode = "ro"
-		}
-		binds = append(binds, fmt.Sprintf("%s:/data:%s", opts.DataDir, mode))
+	mode := "rw"
+	if opts.ReadOnlyData {
+		mode = "ro"
 	}
-	return binds
+	return []string{fmt.Sprintf("%s:/data:%s", opts.DataDir, mode)}
 }
 
 // baseHostConfig builds the sandbox HostConfig shared by every phase:
 // network access follows runner/challenge policy rather than being
 // hardcoded, and every container drops all Linux capabilities, blocks
 // privilege escalation, and caps the number of processes it may run.
-func baseHostConfig(binds []string, resources container.Resources, networkEnabled bool) *container.HostConfig {
+func baseHostConfig(mounts []mount.Mount, binds []string, resources container.Resources, networkEnabled bool) *container.HostConfig {
 	pidsLimit := int64(sandboxPidsLimit)
 	resources.PidsLimit = &pidsLimit
 	netMode := container.NetworkMode("none")
@@ -63,6 +90,7 @@ func baseHostConfig(binds []string, resources container.Resources, networkEnable
 	}
 	return &container.HostConfig{
 		Binds:       binds,
+		Mounts:      mounts,
 		Resources:   resources,
 		NetworkMode: netMode,
 		CapDrop:     []string{"ALL"},

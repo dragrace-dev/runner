@@ -10,7 +10,9 @@ import (
 	"dragrace/internal/config"
 	"dragrace/internal/docker"
 	"dragrace/internal/executor"
+	"dragrace/internal/gpu"
 	"dragrace/internal/process"
+	"dragrace/internal/system"
 )
 
 // Options configures a local test run.
@@ -123,12 +125,35 @@ func Run(opts *Options) error {
 	}
 
 	// ── Initialize executor ─────────────────────────────────────────────
+	// Local runs honour the same operator GPU ceiling as a remote runner
+	// (#65), so a challenge author can reproduce a GPU job locally. Hardware
+	// detection is skipped entirely on the default path (RUNNER_GPUS=none).
+	gpuRequest := config.Load().GPUs
 	var exec executor.Executor
+	// gpuPolicy stays the zero value (Count 0) for the process executor,
+	// where RUNNER_GPUS other than "none" is already rejected below — so a
+	// challenge's limits.gpu (#66) is clamped against 0 there too.
+	var gpuPolicy gpu.Policy
 	switch opts.Executor {
 	case "process":
+		if gpu.Requested(gpuRequest) {
+			return fmt.Errorf("RUNNER_GPUS is only meaningful with the docker executor; the process executor runs scripts on this host, where they already see every GPU")
+		}
 		exec, err = process.NewExecutor(opts.DataDir)
 	case "docker":
-		exec, err = docker.NewExecutor("")
+		var detected []system.GPUInfo
+		if gpu.Requested(gpuRequest) {
+			detected = system.DetectGPUs()
+		}
+		var gpuErr error
+		gpuPolicy, gpuErr = gpu.Resolve(gpuRequest, detected)
+		if gpuErr != nil {
+			return gpuErr
+		}
+		if gpuPolicy.Enabled() {
+			fmt.Printf("🎛️  GPUs:      %s\n", gpuPolicy.Describe())
+		}
+		exec, err = docker.NewExecutor("", gpuPolicy)
 	default:
 		return fmt.Errorf("unknown executor: %s (use 'docker' or 'process')", opts.Executor)
 	}
@@ -258,7 +283,10 @@ func Run(opts *Options) error {
 			log.Printf("  ⚠️  Failed to parse limits, using defaults: %v", err)
 			parsedLimits = &config.ParsedLimits{}
 		}
-		parsedLimits = config.ClampToRunnerCaps(parsedLimits, false)
+		parsedLimits, err = config.ClampToRunnerCaps(parsedLimits, false, gpuPolicy.Count)
+		if err != nil {
+			return fmt.Errorf("RUN failed: %w", err)
+		}
 
 		runMetrics, _, err := exec.RunMeasured(ctx, &executor.RunOptions{
 			Image:          image,

@@ -18,6 +18,7 @@ import (
 	"dragrace/internal/docker"
 	"dragrace/internal/executor"
 	"dragrace/internal/git"
+	"dragrace/internal/gpu"
 	"dragrace/internal/lifecycle"
 	"dragrace/internal/metrics"
 	natsclient "dragrace/internal/nats"
@@ -91,6 +92,7 @@ type Handler struct {
 	runnerID    string
 	workDir     string
 	airGapped   bool          // forbid sandbox network egress regardless of challenge policy
+	gpuPolicy   gpu.Policy    // this runner's resolved RUNNER_GPUS policy (#65/#66); gpuPolicy.Count is the ceiling limits.gpu is clamped to, gpuPolicy.Allows scopes GPU metrics to allocated cards (#67)
 	jobActivity chan struct{} // signalled when a job is received
 	state       *lifecycle.State
 	jobsMu      sync.Mutex
@@ -162,7 +164,7 @@ func (result *jobExecutionResult) addLog(phase, value string) {
 	result.LogsTruncated = result.LogsTruncated || truncated
 }
 
-func NewHandler(nc *natsclient.Client, exec executor.Executor, runnerID string, state *lifecycle.State, airGapped bool) *Handler {
+func NewHandler(nc *natsclient.Client, exec executor.Executor, runnerID string, state *lifecycle.State, airGapped bool, gpuPolicy gpu.Policy) *Handler {
 	workDir := os.Getenv("DRAGRACE_WORK_DIR")
 	if workDir == "" {
 		workDir = "/tmp/dragrace"
@@ -173,6 +175,7 @@ func NewHandler(nc *natsclient.Client, exec executor.Executor, runnerID string, 
 		runnerID:    runnerID,
 		workDir:     workDir,
 		airGapped:   airGapped,
+		gpuPolicy:   gpuPolicy,
 		jobActivity: make(chan struct{}, 1),
 		state:       state,
 	}
@@ -361,7 +364,10 @@ func (h *Handler) executeJob(ctx context.Context, job *JobMessage) (*jobExecutio
 	if err != nil {
 		return result, fmt.Errorf("invalid trusted challenge limits: %w", err)
 	}
-	parsedLimits = config.ClampToRunnerCaps(parsedLimits, h.airGapped)
+	parsedLimits, err = config.ClampToRunnerCaps(parsedLimits, h.airGapped, h.gpuPolicy.Count)
+	if err != nil {
+		return result, err
+	}
 	result.Environment["network_enabled"] = parsedLimits.NetworkEnabled
 	result.Environment["resource_limits"] = map[string]interface{}{
 		"memory_bytes": parsedLimits.MemoryBytes,
@@ -407,18 +413,36 @@ func (h *Handler) executeJob(ctx context.Context, job *JobMessage) (*jobExecutio
 		// for the whole measurement campaign.
 		iterationCtx, cancelIteration := context.WithTimeout(ctx, parsedLimits.Timeout)
 
-		// Sample the GPU alongside the run. Start is a no-op when no vendor is
-		// present, so this costs nothing on a CPU-only host.
-		gpuCollector := metrics.NewGPUCollector(100)
-		gpuCollector.Start(iterationCtx)
+		// Sample the GPU alongside the run, but only when this runner's
+		// RUNNER_GPUS policy actually grants the job container a GPU (#67).
+		// Skipping the collector entirely when nothing is allocated is
+		// deliberate, not just an optimisation: it is what guarantees a
+		// GPU-less run reports no GPU aggregate at all, rather than
+		// attributing to the job whatever activity the host's cards happen
+		// to show, up to and including another job's usage of a different
+		// card. The collector itself has no per-container view — nvidia-smi/
+		// rocm-smi/ioreg run in the runner process, on the host — so even
+		// when it does run, its samples are filtered below down to the cards
+		// h.gpuPolicy actually exposed, never the raw host-wide reading.
+		var gpuCollector *metrics.GPUCollector
+		if h.gpuPolicy.Enabled() {
+			gpuCollector = metrics.NewGPUCollector(100)
+			gpuCollector.Start(iterationCtx)
+		}
 
 		iterationMetrics, runLogs, err := h.executor.RunMeasured(iterationCtx, runOptions)
 
-		gpuSeries := gpuCollector.Stop()
+		var gpuAggregates *metrics.GPUAggregates
+		if gpuCollector != nil {
+			gpuSeries := gpuCollector.Stop()
+			gpuAggregates = metrics.AllocatedGPUAggregates(gpuSeries, func(vendor metrics.GPUVendor, deviceID int) bool {
+				return h.gpuPolicy.Allows(string(vendor), deviceID)
+			})
+		}
 		cancelIteration()
 
-		if iterationMetrics != nil && len(gpuSeries.Samples) > 0 {
-			iterationMetrics.GPUAggregates = metrics.ComputeGPUAggregates(gpuSeries)
+		if iterationMetrics != nil {
+			iterationMetrics.GPUAggregates = gpuAggregates
 		}
 
 		// Only the last iteration's logs are kept, so the bound from #23 holds

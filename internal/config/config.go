@@ -16,6 +16,7 @@ type Config struct {
 	HealthAddr         string // local health endpoint listen address
 	AirGapped          bool   // forbid all sandbox network egress, regardless of challenge policy
 	NativeRiskAccepted bool   // explicit operator opt-in for remote native execution
+	GPUs               string // GPU exposure ceiling for job containers: "none" (default), "all", or "0,1"
 }
 
 func Load() *Config {
@@ -30,6 +31,7 @@ func Load() *Config {
 		HealthAddr:         getEnv("RUNNER_HEALTH_ADDR", "127.0.0.1:8081"),
 		AirGapped:          getEnvBool("RUNNER_AIRGAPPED", false),
 		NativeRiskAccepted: getEnvBool("RUNNER_NATIVE_RISK_ACCEPTED", false),
+		GPUs:               getEnv("RUNNER_GPUS", "none"),
 	}
 }
 

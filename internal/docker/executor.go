@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"dragrace/internal/executor"
+	"dragrace/internal/gpu"
 	"dragrace/internal/metrics"
 
 	"github.com/docker/docker/api/types/container"
@@ -20,6 +21,9 @@ import (
 // Executor implements executor.Executor using Docker containers.
 type Executor struct {
 	client *client.Client
+	// gpuPolicy is the operator's GPU exposure ceiling (#65), resolved and
+	// validated once at startup. Its zero value exposes no GPU.
+	gpuPolicy gpu.Policy
 }
 
 // Baseline resource ceilings per phase, applied when a challenge sets no
@@ -39,7 +43,10 @@ const (
 // Compile-time check that Executor implements the interface.
 var _ executor.Executor = (*Executor)(nil)
 
-func NewExecutor(dockerHost string) (*Executor, error) {
+// NewExecutor builds a Docker executor. gpuPolicy is the operator's GPU
+// exposure ceiling, already resolved against the host's actual hardware
+// (#65); pass the zero Policy to expose no GPU, which is the default.
+func NewExecutor(dockerHost string, gpuPolicy gpu.Policy) (*Executor, error) {
 	opts := []client.Opt{
 		client.FromEnv,
 	}
@@ -53,10 +60,20 @@ func NewExecutor(dockerHost string) (*Executor, error) {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
+	// The client above connected to nothing: it is lazy. Block until the daemon
+	// actually answers, so a daemon that is absent or still starting (#70:
+	// dockerd boots inside this very container) surfaces here instead of as a
+	// failure of the first job submitted. See wait.go.
+	if err := waitForDaemon(context.Background(), cli, cli.DaemonHost(), daemonWaitTimeout()); err != nil {
+		cli.Close()
+		return nil, err
+	}
+
 	log.Println("✅ Docker client initialized")
 
 	return &Executor{
-		client: cli,
+		client:    cli,
+		gpuPolicy: gpuPolicy,
 	}, nil
 }
 
@@ -88,6 +105,7 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
+	mounts := buildMounts(opts)
 	binds := buildBinds(opts)
 
 	// Configure resources, sized to what this host can actually run (#58).
@@ -107,9 +125,12 @@ func (e *Executor) RunScript(ctx context.Context, opts *executor.RunOptions) (st
 		WorkingDir: "/workspace",
 		Labels:     sandboxLabels,
 	}
-	hostCfg := baseHostConfig(binds, resources, opts.NetworkEnabled)
+	hostCfg := baseHostConfig(mounts, binds, resources, opts.NetworkEnabled)
 	if !opts.Trusted {
 		hardenSandbox(containerCfg, hostCfg)
+	}
+	if err := applyGPUPolicy(hostCfg, e.gpuPolicy); err != nil {
+		return "", err
 	}
 
 	// Create container
@@ -192,6 +213,7 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 	cmd := buildDockerCmd(opts)
 
 	// Configure mounts
+	mounts := buildMounts(opts)
 	binds := buildBinds(opts)
 
 	// Configure resources, sized to what this host can actually run (#58).
@@ -211,8 +233,11 @@ func (e *Executor) RunMeasured(ctx context.Context, opts *executor.RunOptions) (
 		WorkingDir: "/workspace",
 		Labels:     sandboxLabels,
 	}
-	hostCfg := baseHostConfig(binds, resources, opts.NetworkEnabled)
+	hostCfg := baseHostConfig(mounts, binds, resources, opts.NetworkEnabled)
 	hardenSandbox(containerCfg, hostCfg)
+	if err := applyGPUPolicy(hostCfg, e.gpuPolicy); err != nil {
+		return nil, "", err
+	}
 
 	// Create container
 	resp, err := e.client.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "")
@@ -384,7 +409,10 @@ func (e *Executor) hostCapacity(ctx context.Context) (nanoCPUs int64, memBytes i
 	if info.NCPU <= 0 {
 		return 0, 0, fmt.Errorf("docker host reported no usable CPUs")
 	}
-	return int64(info.NCPU) * 1_000_000_000, info.MemTotal, nil
+	// With a nested daemon (#70) the numbers above describe the machine, not
+	// the cgroup job containers actually run in. See capacity.go.
+	nanoCPUs, memBytes = clampToOwnCgroup(int64(info.NCPU)*1_000_000_000, info.MemTotal)
+	return nanoCPUs, memBytes, nil
 }
 
 // resolveResources builds the container.Resources for a phase from its

@@ -1,0 +1,100 @@
+# DragRace runner — standalone stack, docker-in-docker (#70).
+#
+#   docker compose -f docker-compose.dind.yml up -d
+#
+# Standalone on purpose, NOT an override of docker-compose.yml. The monorepo's
+# root docker-compose.dind.yml is an override and has to fight Compose's
+# sequence-merging rules with `!reset` and `!override` to undo the base's
+# hardening. Nobody running a runner for the first time should have to reason
+# about that, so this file states everything it grants, in one place, plainly.
+# The cost is duplication between the two files here: change one, check the
+# other.
+#
+# WHAT THIS TRADES. Read docs/RUNNER_THREAT_MODEL.md ▸ "Variante
+# docker-in-docker" before using it. In one line: the DooD stack mounts the host
+# socket, which is root on the host and makes job sandboxes siblings of every
+# other container on the machine; this stack instead grants the runner container
+# `privileged`, which is also a path to the host, but job sandboxes then live on
+# a daemon that cannot see anything else. Better lateral isolation, worse
+# vertical isolation. Neither is a sandbox for hostile code on a machine you
+# care about. rootless-dind and sysbox are the ways out of `privileged`; neither
+# is implemented here.
+#
+# NO GPU. The daemon started inside this container is not the host's: no nvidia
+# runtime, no container toolkit, no device nodes. The entrypoint refuses to
+# start when RUNNER_GPUS asks for a card rather than silently measuring on CPU.
+# Use docker-compose.yml (DooD) on GPU hosts.
+
+services:
+  runner:
+    # See docker-compose.yml for the published-image alternative. The digest to
+    # pin for this variant is the one behind the `-dind` tag; the two variants
+    # are separate images and their digests are not interchangeable.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dind
+    container_name: dragrace-runner-dind
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8081:8081"
+
+    # dockerd needs to create namespaces, mount overlayfs and program iptables.
+    # There is no reduced capability set that lets it do that, which is exactly
+    # why this variant is a trade-off and not an improvement.
+    #
+    # Note what is NOT here: no cap_drop, no no-new-privileges. They are not
+    # omitted by oversight — they are incompatible with the line below, and
+    # listing them would make this file lie about what it grants.
+    privileged: true
+
+    environment:
+      WS_BACKEND_URL: ${WS_BACKEND_URL:-wss://ws.dragrace.dev}
+      BACKEND_URL: ${BACKEND_URL:-https://dragrace.dev}
+      RUNNER_ID: ${RUNNER_ID:?set RUNNER_ID to a name unique to this runner}
+      RUNNER_HEALTH_ADDR: 0.0.0.0:8081
+      RUNNER_UPDATE_PUBLIC_KEY: ${RUNNER_UPDATE_PUBLIC_KEY:-}
+
+      # Kept at `none` and refused otherwise — see the GPU note in the header.
+      RUNNER_GPUS: ${RUNNER_GPUS:-none}
+
+      # The socket the entrypoint starts dockerd on. It lives INSIDE this
+      # container; nothing on the host can reach it. The image rejects any
+      # non-unix:// value here rather than starting a daemon nothing uses.
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+      # Job checkouts stay container-internal here, and that is correct: dockerd
+      # shares this container's filesystem, so runner and daemon resolve the
+      # same path. The identical-path bind that DooD requires (#68) is neither
+      # needed nor used, which is the one real ergonomic win of this variant.
+      DRAGRACE_WORK_DIR: ${RUNNER_JOB_DIR:-/var/lib/dragrace/jobs}
+
+      # Also set by the image; repeated here so the file states it. Makes the
+      # runner size job resources against THIS container's cgroup rather than
+      # the whole machine — without it, a memory-capped container reports the
+      # host's RAM and jobs get OOM-killed instead of refused (#58).
+      RUNNER_DOCKER_NESTED: "true"
+
+    volumes:
+      # The inner daemon's storage. Without it, every recreate starts from an
+      # empty image store — a full re-pull of every challenge base image — and
+      # /var/lib/docker would sit in the container's overlay upper layer, i.e.
+      # overlayfs on overlayfs.
+      - runner_cache:/var/lib/docker
+      - runner_credentials:/root/.dragrace
+
+    # NO host socket bind. If you find yourself adding one, you want the DooD
+    # stack instead: mounting both would let this container drive its own daemon
+    # AND the host's, which is the worst of both variants.
+
+    # `docker stop` signals PID 1 only, then SIGKILLs whatever is left. PID 1
+    # here is the entrypoint: it stops the runner, then gives dockerd
+    # RUNNER_DIND_STOP_TIMEOUT (20s) to flush containerd state and unmount
+    # overlays. The 10s default would guarantee a SIGKILL mid-shutdown on a
+    # volume we intend to keep.
+    stop_grace_period: 1m
+
+volumes:
+  runner_cache:
+  runner_credentials:

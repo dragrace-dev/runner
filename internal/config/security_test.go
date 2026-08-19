@@ -47,13 +47,16 @@ func TestValidateSolutionSpecRejectsUntrustedEscapes(t *testing.T) {
 }
 
 func TestClampToRunnerCaps(t *testing.T) {
-	effective := ClampToRunnerCaps(&ParsedLimits{
+	effective, err := ClampToRunnerCaps(&ParsedLimits{
 		MemoryBytes:    RunnerMaxMemoryBytes * 2,
 		CPUNano:        RunnerMaxCPUNano * 2,
 		Timeout:        2 * RunnerMaxTimeout,
 		DiskBytes:      RunnerMaxDiskBytes * 2,
 		NetworkEnabled: true,
-	}, false)
+	}, false, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if effective.MemoryBytes != RunnerMaxMemoryBytes || effective.CPUNano != RunnerMaxCPUNano || effective.Timeout != RunnerMaxTimeout || effective.DiskBytes != RunnerMaxDiskBytes {
 		t.Fatalf("runner caps were not enforced: %#v", effective)
 	}
@@ -63,14 +66,60 @@ func TestClampToRunnerCaps(t *testing.T) {
 }
 
 func TestClampToRunnerCapsForcesNetworkOffWhenAirGapped(t *testing.T) {
-	effective := ClampToRunnerCaps(&ParsedLimits{
+	effective, err := ClampToRunnerCaps(&ParsedLimits{
 		MemoryBytes:    RunnerMaxMemoryBytes,
 		CPUNano:        RunnerMaxCPUNano,
 		Timeout:        RunnerMaxTimeout,
 		NetworkEnabled: true,
-	}, true)
+	}, true, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if effective.NetworkEnabled {
 		t.Fatal("air-gapped runner policy must override a challenge's network: enabled request")
+	}
+}
+
+// Task #66: limits.gpu is a portable GPU count, clamped against the
+// runner's resolved RUNNER_GPUS policy (#65) — but unlike memory/CPU/
+// timeout/disk, an overage is refused outright rather than silently
+// reduced. A degraded GPU run (or one silently dropped to zero) is not a
+// smaller version of the same measurement: it is a different one, and
+// scoring it as comparable would corrupt results (#26, #60).
+func TestClampToRunnerCapsAllowsGPURequestWithinRunnerPolicy(t *testing.T) {
+	effective, err := ClampToRunnerCaps(&ParsedLimits{
+		CPUNano:  RunnerMaxCPUNano,
+		GPUCount: 2,
+	}, false, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if effective.GPUCount != 2 {
+		t.Fatalf("expected the GPU request to be honored, got %d", effective.GPUCount)
+	}
+}
+
+func TestClampToRunnerCapsRejectsGPURequestBeyondRunnerPolicy(t *testing.T) {
+	_, err := ClampToRunnerCaps(&ParsedLimits{
+		CPUNano:  RunnerMaxCPUNano,
+		GPUCount: 1,
+	}, false, 0)
+	if err == nil {
+		t.Fatal("expected a GPU request beyond the runner's RUNNER_GPUS policy to be rejected explicitly")
+	}
+	for _, want := range []string{"1", "RUNNER_GPUS"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected the error to mention %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestClampToRunnerCapsRejectsGPURequestExceedingPartialRunnerPolicy(t *testing.T) {
+	// Even a partial overage (runner exposes some GPUs, just not enough)
+	// is refused, not silently reduced to what's available.
+	_, err := ClampToRunnerCaps(&ParsedLimits{GPUCount: 4}, false, 2)
+	if err == nil {
+		t.Fatal("expected an over-subscribed GPU request to be rejected, not clamped down")
 	}
 }
 
@@ -113,5 +162,22 @@ func TestChallengeLimitParsingRequiresStrictValues(t *testing.T) {
 	}
 	if _, err := (&LimitsConfig{Memory: "2GB", CPU: "2.0", Timeout: (-time.Second).String()}).Parse(); err == nil {
 		t.Fatal("expected non-positive timeout rejection")
+	}
+	if _, err := (&LimitsConfig{Memory: "2GB", CPU: "2.0", Timeout: "30s", GPU: -1}).Parse(); err == nil {
+		t.Fatal("expected negative gpu count rejection")
+	}
+	parsed, err := (&LimitsConfig{Memory: "2GB", CPU: "2.0", Timeout: "30s", GPU: 2}).Parse()
+	if err != nil {
+		t.Fatalf("expected a positive gpu count to parse: %v", err)
+	}
+	if parsed.GPUCount != 2 {
+		t.Fatalf("expected GPUCount 2, got %d", parsed.GPUCount)
+	}
+	unset, err := (&LimitsConfig{Memory: "2GB", CPU: "2.0", Timeout: "30s"}).Parse()
+	if err != nil {
+		t.Fatalf("expected an omitted gpu field to parse: %v", err)
+	}
+	if unset.GPUCount != 0 {
+		t.Fatalf("expected an omitted gpu field to default to 0, got %d", unset.GPUCount)
 	}
 }

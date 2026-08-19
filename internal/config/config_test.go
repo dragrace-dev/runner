@@ -15,3 +15,17 @@ func TestLoadNativeRiskAcceptanceExplicit(t *testing.T) {
 		t.Fatal("expected explicit native risk acceptance")
 	}
 }
+
+func TestLoadGPUExposureDefaultsToNone(t *testing.T) {
+	t.Setenv("RUNNER_GPUS", "")
+	if got := Load().GPUs; got != "none" {
+		t.Fatalf("GPU exposure must default to none, got %q", got)
+	}
+}
+
+func TestLoadGPUExposureReadsEnv(t *testing.T) {
+	t.Setenv("RUNNER_GPUS", "0,1")
+	if got := Load().GPUs; got != "0,1" {
+		t.Fatalf("expected the raw RUNNER_GPUS value, got %q", got)
+	}
+}

@@ -1,0 +1,110 @@
+# DragRace runner — standalone stack, docker-out-of-docker (the default).
+#
+#   docker compose up -d
+#
+# WHO THIS IS FOR. Anyone running a runner of their own against a DragRace
+# backend they do not host: clone dragrace-dev/runner, set RUNNER_ID, start.
+# It deliberately declares ONE service and no database, message bus or
+# frontend — those belong to the backend operator, not to you. The monorepo's
+# root docker-compose.yml is the opposite: a full local development stack that
+# happens to include a runner. Do not copy settings between the two without
+# reading why they differ.
+#
+# WHAT DOCKER-OUT-OF-DOCKER MEANS HERE. The runner starts no daemon of its own.
+# It drives the host's daemon through the mounted socket below, so job sandboxes
+# are siblings of every other container on this machine, and the socket is
+# root-equivalent on the host. That is the accepted trade-off of this variant;
+# docker-compose.dind.yml takes the other one. Read
+# docs/RUNNER_THREAT_MODEL.md before deciding, and do not run either variant on
+# a machine whose compromise would matter to you.
+
+services:
+  runner:
+    # Built from the source you already cloned, so this file works offline and
+    # needs no registry access. To run the signed, scanned image published on
+    # tag instead, delete the `build:` block and pin a digest — a tag alone
+    # would defeat the point:
+    #
+    #   image: ghcr.io/dragrace-dev/runner@sha256:<digest>
+    #
+    # then verify it before first use:
+    #
+    #   cosign verify ghcr.io/dragrace-dev/runner@sha256:<digest> \
+    #     --certificate-identity-regexp '^https://github.com/dragrace-dev/runner/' \
+    #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Named explicitly. Dockerfile also carries a `dind` target (#70); the
+      # stage order already makes `dood` the implicit default, but naming it
+      # here means a reordering of that file cannot silently hand this stack a
+      # privileged container.
+      target: dood
+    container_name: dragrace-runner
+    restart: unless-stopped
+
+    # A runner is a long-lived worker, not a service anyone should reach. The
+    # health endpoint stays on the loopback interface: it exists for `docker
+    # inspect` and for you, not for the network.
+    ports:
+      - "127.0.0.1:8081:8081"
+
+    # The runner container itself needs no capability and must never gain
+    # privileges. Job sandboxes get their own, stricter treatment in
+    # internal/docker/sandbox.go — this is the outer layer, not that one.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    environment:
+      # Defaults point at the hosted backend, so an operator who only sets
+      # RUNNER_ID gets a working runner. Override both to target your own.
+      WS_BACKEND_URL: ${WS_BACKEND_URL:-wss://ws.dragrace.dev}
+      BACKEND_URL: ${BACKEND_URL:-https://dragrace.dev}
+
+      # Must be unique per runner. Two runners sharing an ID will fight over
+      # the same job subject.
+      RUNNER_ID: ${RUNNER_ID:?set RUNNER_ID to a name unique to this runner}
+
+      RUNNER_HEALTH_ADDR: 0.0.0.0:8081
+
+      # Public half of the update-signing key. Left empty, self-update is
+      # refused rather than performed unverified. Never put the private half
+      # anywhere near this file.
+      RUNNER_UPDATE_PUBLIC_KEY: ${RUNNER_UPDATE_PUBLIC_KEY:-}
+
+      # GPU exposure policy (#65): `none`, `all`, or explicit indices ("0,1").
+      # Validated at startup against the hardware actually detected, so a wrong
+      # value fails the container rather than the first job.
+      RUNNER_GPUS: ${RUNNER_GPUS:-none}
+
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+      # Same value as the bind below, and that is the entire point — see the
+      # volumes section.
+      DRAGRACE_WORK_DIR: ${RUNNER_JOB_DIR:-/var/lib/dragrace/jobs}
+
+    volumes:
+      # Root-equivalent on the host. It is what makes this variant work and
+      # what makes it dangerous; there is no version of DooD without it.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # SOURCE AND TARGET ARE IDENTICAL ON PURPOSE (#68). The runner clones each
+      # job here and then asks the daemon to bind that path into the sandbox —
+      # but it is the HOST daemon that resolves it, in the host's filesystem.
+      # If the two sides disagree, the daemon cannot find the source and
+      # container creation fails with "bind source path does not exist". Keeping
+      # the path identical on both sides is what makes them agree.
+      #
+      # macOS/Docker Desktop: /var/lib is not shared with the VM by default. Set
+      # RUNNER_JOB_DIR to something under /tmp, or add the directory to Docker
+      # Desktop's file sharing list.
+      - ${RUNNER_JOB_DIR:-/var/lib/dragrace/jobs}:${RUNNER_JOB_DIR:-/var/lib/dragrace/jobs}
+
+      # Device-flow credentials obtained by `runner login`. Losing this volume
+      # means re-enrolling the runner.
+      - runner_credentials:/root/.dragrace
+
+volumes:
+  runner_credentials:

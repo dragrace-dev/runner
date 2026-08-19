@@ -15,6 +15,7 @@ import (
 	"dragrace/internal/config"
 	"dragrace/internal/docker"
 	"dragrace/internal/executor"
+	"dragrace/internal/gpu"
 	"dragrace/internal/health"
 	"dragrace/internal/jobs"
 	"dragrace/internal/lifecycle"
@@ -68,6 +69,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  RUNNER_IDLE_TIMEOUT   Idle timeout in minutes (default: 0 = infinite)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_HEALTH_ADDR    Local health endpoint (default: 127.0.0.1:8081)\n")
 		fmt.Fprintf(os.Stderr, "  RUNNER_AIRGAPPED      Forbid all sandbox network egress, overriding challenge policy (default: false)\n")
+		fmt.Fprintf(os.Stderr, "  RUNNER_GPUS           GPUs exposed to job containers: none (default), all, or indexes like 0,1\n")
 	}
 	flag.Parse()
 
@@ -176,6 +178,19 @@ func main() {
 	log.Printf("📊 Hardware: %s (%d cores, %.1f GB RAM)", hwInfo.CPUModel, hwInfo.CPUCores, hwInfo.MemoryTotalGB)
 	log.Printf("🔑 Fingerprint: %s", hwInfo.Fingerprint[:16]+"...")
 
+	// Resolve the operator's GPU exposure ceiling against the GPUs actually
+	// detected above (#65). This happens before registration on purpose: a
+	// runner told to expose a GPU it does not have must die here, with a
+	// clear message, rather than accept jobs it cannot honour.
+	if gpu.Requested(cfg.GPUs) && cfg.Executor != "docker" {
+		log.Fatalf("🛑 RUNNER_GPUS is only meaningful with the docker executor; the %q executor runs jobs directly on the host, where they already see every GPU. Set RUNNER_GPUS=none.", cfg.Executor)
+	}
+	gpuPolicy, err := gpu.Resolve(cfg.GPUs, hwInfo.GPUs)
+	if err != nil {
+		log.Fatalf("🛑 %v", err)
+	}
+	log.Printf("🎛️  GPU exposure: %s", gpuPolicy.Describe())
+
 	// Register with retry (backend may not be ready yet)
 	var regResult *registration.RegisterResponse
 	maxRetries := 30
@@ -244,7 +259,7 @@ func main() {
 			log.Fatalf("❌ Failed to initialize process executor: %v", err)
 		}
 	case "docker":
-		exec, err = docker.NewExecutor(cfg.DockerHost)
+		exec, err = docker.NewExecutor(cfg.DockerHost, gpuPolicy)
 		if err != nil {
 			log.Fatalf("❌ Failed to initialize Docker executor: %v", err)
 		}
@@ -253,8 +268,12 @@ func main() {
 	}
 	defer exec.Close()
 
-	// Initialize job handler
-	handler := jobs.NewHandler(nc, exec, backendRunnerID, runnerState, cfg.AirGapped)
+	// Initialize job handler. gpuPolicy.Count is the ceiling a challenge's
+	// declared limits.gpu is checked against (#66): the number of GPUs
+	// RUNNER_GPUS actually resolved to on this host, not simply "some GPU
+	// exists". The handler also uses gpuPolicy.Allows to scope GPU metrics
+	// to the cards a job's container was actually granted (#67).
+	handler := jobs.NewHandler(nc, exec, backendRunnerID, runnerState, cfg.AirGapped, gpuPolicy)
 
 	// Subscribe to job submit topic
 	jobSubject := fmt.Sprintf("dragrace.dev.runner.%s.job.submit", backendRunnerID)

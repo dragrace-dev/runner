@@ -251,6 +251,13 @@ func getMemoryTotal() float64 {
 	return 0
 }
 
+// DetectGPUs returns the GPUs present on this host. Exported for callers
+// that need the GPU inventory alone (e.g. resolving the RUNNER_GPUS exposure
+// policy) without paying for a full hardware collection.
+func DetectGPUs() []GPUInfo {
+	return detectGPUs()
+}
+
 // detectGPUs detects all GPUs in the system
 func detectGPUs() []GPUInfo {
 	gpus := []GPUInfo{}

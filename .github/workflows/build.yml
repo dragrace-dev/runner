@@ -1,9 +1,29 @@
 name: Build Runner Binaries
 
+# This workflow does NOT run in the monorepo: GitHub only reads .github/workflows
+# at a repository root. It is mirrored verbatim to dragrace-dev/runner by the
+# monorepo's .github/workflows/split-runner.yml (rsync -a --delete of runner/),
+# and runs there, where this directory IS the repository root. Every path below
+# is therefore relative to runner/.
+#
+# It is the only publication path for the runner: the monorepo's build-runner.yml
+# builds but no longer publishes (94784cf). Do not reintroduce an image or
+# release job in the monorepo.
+#
+# scripts/check-supply-chain-pins.sh in the monorepo scans this file too, so
+# every `uses:` here must carry a full 40-hex commit SHA.
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -21,10 +41,10 @@ jobs:
             goarch: arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
@@ -53,7 +73,7 @@ jobs:
           chmod +x "dist/${BINARY_NAME}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/dragrace-runner-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -62,21 +82,22 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    environment: runner-release
     permissions:
       contents: write
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: repo
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: repo/go.mod
 
@@ -93,11 +114,141 @@ jobs:
         working-directory: repo
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          
+
           # Create release if it doesn't exist
           if ! gh release view "$TAG" &>/dev/null; then
             gh release create "$TAG" --generate-notes
           fi
-          
+
           # Upload binaries (overwrites existing assets)
           gh release upload "$TAG" ../dist/dragrace-runner-* --clobber
+
+  # Container image, docker-out-of-docker variant (#69). Mirrors the frontend and
+  # backend jobs of the monorepo's .github/workflows/deploy.yml: BuildKit builder,
+  # metadata-action, max provenance, SBOM, keyless Cosign on the digest, blocking
+  # trivy gate. The one deliberate deviation is ordering: the scan runs BEFORE the
+  # signature, so an image that fails the gate is never signed and therefore never
+  # passes `cosign verify` on an operator's host.
+  #
+  # Both runtime variants are published here (#70), from the two targets of the
+  # single runner/Dockerfile — `X.Y.Z` (docker-out-of-docker) and `X.Y.Z-dind`
+  # (privileged, internal dockerd). They are one image family, not two products:
+  # same runner binary, same builder stage, same scan and signature.
+  #
+  # fail-fast is off on purpose. The dind base carries a whole dockerd,
+  # containerd, runc and iptables, so it is far likelier to trip the trivy gate
+  # than plain Alpine; when it does, the DooD image — the one most operators
+  # run — must still ship. A missing `-dind` tag on a release is a visible,
+  # recoverable state; a blocked release is not.
+  #
+  # No job-level `outputs`: with a matrix the last leg to finish would win, and
+  # nothing downstream consumes them. Each leg records its own digest in the run
+  # summary instead.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: runner-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: dood
+            target: dood
+            flavor: latest=false
+          - variant: dind
+            target: dind
+            flavor: |
+              latest=false
+              suffix=-dind
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Provenance and SBOM attestations need a BuildKit builder: the default
+      # `docker` driver rejects them outright.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # Only immutable version tags. No `latest`, no rolling major/minor alias:
+      # docs/RELEASE_SECURITY.md deploys by digest, and a moving alias on a signed
+      # image is an invitation to verify one artifact and run another.
+      #
+      # matrix.flavor carries the variant suffix, so tag v1.2.3 publishes
+      # v1.2.3 / 1.2.3 for the DooD leg and v1.2.3-dind / 1.2.3-dind for the
+      # dind leg. The suffix is part of the tag, never of the image name: one
+      # package, one signing identity, one set of digests.
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: ${{ matrix.flavor }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+
+      # linux/amd64 only for now. Multi-arch would need QEMU emulation for the
+      # arm64 Go build; arm64 and macOS hosts are served by the signed binaries
+      # published by the release job above.
+      - id: build
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan runner image (${{ matrix.variant }})
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+
+      - name: Sign immutable runner image (${{ matrix.variant }})
+        run: cosign sign --yes "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+
+      - name: Record the published digest
+        run: |
+          {
+            echo "### Runner image (${{ matrix.variant }})"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Deploy by digest. Verify with:"
+            echo
+            echo '```'
+            echo "cosign verify ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
