@@ -1,0 +1,48 @@
+# Read by `trivy` directly (aquasecurity/trivy-action passes this path via
+# the `trivyignores` input on the image-scan step in .github/workflows/build.yml).
+#
+# CVE-2026-34040 / GO-2026-4887 — Moby AuthZ plugin bypass on oversized
+# request bodies. Daemon-side flaw in the authorization-plugin path; this
+# image only ever runs the runner binary, which is an API *client*
+# (internal/docker) and never serves or validates plugin requests. Fixed
+# upstream only under the github.com/moby/moby/v2 module path (v2.0.0-beta.8),
+# which is still a beta and a breaking import-path migration — no released
+# version of github.com/docker/docker carries the fix, so no dependency bump
+# clears this. Same advisory, same reasoning, as the ALLOWLIST entry in
+# scripts/check-runner-vulns.mjs (the govulncheck gate). Remove this line
+# once github.com/docker/docker itself ships a fixed release.
+CVE-2026-34040
+
+# ── dind-only: stale Go toolchain baked into docker:29.7.2-dind's pre-built
+# binaries (dockerd, containerd, containerd-shim-runc-v2, ctr, runc, docker,
+# docker-proxy) ────────────────────────────────────────────────────────────
+#
+# This repo does not compile any of these; they ship as-is inside the docker
+# base image (Dockerfile `dind` stage), and 29.7.2 is upstream's latest
+# published `-dind` tag — there is no newer release to bump to. Every entry
+# below is a Go stdlib/x/net/x/text/x/mod/grpc-go advisory reachable only if
+# something feeds these binaries attacker-controlled network input, and this
+# variant's dockerd never gets one: docker-compose.dind.yml documents no host
+# port bind for it, DOCKER_TLS_CERTDIR is forced empty, and
+# dind-entrypoint.sh starts dockerd with an explicit unix:// --host so it
+# never opens the TCP/TLS listener these HTTP/2, DNS-message and TLS advisories
+# target. containerd's gRPC socket (the xDS/RBAC advisory) is the same story:
+# local unix socket for internal engine IPC, never exposed. Reviewed
+# 2026-08-20. Re-review if this variant ever grows a network-facing listener,
+# and drop entries individually as docker:*-dind picks up a Go toolchain that
+# clears them.
+CVE-2026-25681
+CVE-2026-27136
+CVE-2026-33814
+CVE-2026-33818
+CVE-2026-39821
+CVE-2026-46600
+CVE-2026-56852
+CVE-2026-56853
+CVE-2026-56858
+CVE-2026-56859
+CVE-2026-56860
+CVE-2026-56862
+CVE-2026-56864
+CVE-2026-56865
+GHSA-hrxh-6v49-42gf

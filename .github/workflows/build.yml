@@ -228,6 +228,10 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
+          # .trivyignore carries the same per-advisory allowlist discipline as
+          # scripts/check-runner-vulns.mjs: only advisories with no available
+          # upstream fix, each with its own justification.
+          trivyignores: .trivyignore
 
       - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
 

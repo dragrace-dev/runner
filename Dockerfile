@@ -87,6 +87,19 @@ FROM docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6
 # base ships neither reliably, and `apk add` is a no-op when it already has one.
 RUN apk add --no-cache ca-certificates git
 
+# The base image ships docker-compose and docker-buildx CLI plugins nothing
+# here calls: the runner never shells out to `docker` at all (see the
+# exec.Command comment on the DooD stage below), let alone `docker compose` or
+# `docker buildx`. Same CVE-surface argument as that comment, just discovered
+# the hard way — their bundled Go toolchains trip the trivy gate on advisories
+# this image can't reach (docker-buildx's moby/go-archive tar-extraction bug
+# among them). Deleting both is a real surface reduction, not a scanner
+# workaround: ~100MB and every advisory those two binaries carried, gone
+# rather than allowlisted.
+RUN rm -f \
+        /usr/local/bin/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose \
+        /usr/local/libexec/docker/cli-plugins/docker-buildx
+
 COPY --from=builder /runner /usr/local/bin/runner
 COPY dind-entrypoint.sh /usr/local/bin/dragrace-dind-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/dragrace-dind-entrypoint.sh
