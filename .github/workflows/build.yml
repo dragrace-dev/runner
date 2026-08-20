@@ -159,14 +159,24 @@ jobs:
         include:
           - variant: dood
             target: dood
-            flavor: latest=false
+            flavor: latest=auto
           - variant: dind
             target: dind
             flavor: |
-              latest=false
-              suffix=-dind
+              latest=auto
+              suffix=-dind,onlatest=true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Registers binfmt_misc handlers so this amd64 runner can execute
+      # arm64 binaries. The Dockerfile pins its builder stage to
+      # --platform=$BUILDPLATFORM specifically so the Go compiler itself
+      # never runs under this emulation (Go cross-compiles natively); QEMU
+      # only carries the target-arch `apk add`/`rm` lines in the runtime
+      # stages, which is cheap.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
 
       # Provenance and SBOM attestations need a BuildKit builder: the default
       # `docker` driver rejects them outright.
@@ -185,14 +195,21 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      # Only immutable version tags. No `latest`, no rolling major/minor alias:
-      # docs/RELEASE_SECURITY.md deploys by digest, and a moving alias on a signed
-      # image is an invitation to verify one artifact and run another.
+      # Immutable version tags, plus a rolling `latest` / `latest-dind`
+      # convenience alias (matrix.flavor's `latest=auto`) — a plain
+      # `docker pull` without a version in mind is a reasonable thing to
+      # want. docs/RELEASE_SECURITY.md still deploys by digest for anything
+      # that isn't a one-off: a moving alias is exactly the thing that lets
+      # you `cosign verify` one artifact and run another later.
       #
       # matrix.flavor carries the variant suffix, so tag v1.2.3 publishes
-      # v1.2.3 / 1.2.3 for the DooD leg and v1.2.3-dind / 1.2.3-dind for the
-      # dind leg. The suffix is part of the tag, never of the image name: one
-      # package, one signing identity, one set of digests.
+      # v1.2.3 / 1.2.3 / latest for the DooD leg and v1.2.3-dind / 1.2.3-dind
+      # / latest-dind for the dind leg (`onlatest=true` is what makes the
+      # suffix reach the alias too — without it both legs would collide on
+      # a bare `latest`, and DooD is supposed to be everyone's unqualified
+      # default, never the `--privileged` dind leg). The suffix is part of
+      # the tag, never of the image name: one package, one signing
+      # identity, one set of digests.
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
@@ -202,16 +219,13 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
 
-      # linux/amd64 only for now. Multi-arch would need QEMU emulation for the
-      # arm64 Go build; arm64 and macOS hosts are served by the signed binaries
-      # published by the release job above.
       - id: build
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           file: Dockerfile
           target: ${{ matrix.target }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

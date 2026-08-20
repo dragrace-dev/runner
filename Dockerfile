@@ -37,7 +37,21 @@
 # GOTOOLCHAIN=local, so an older toolchain here fails the build outright
 # rather than downloading the required one. The 1.25 line stopped getting
 # alpine3.22 builds at go1.25.11, hence the move to alpine3.23.
-FROM golang:1.25.13-alpine3.23@sha256:42fc3368d1c50170a452f2bf4a1dfd292a065870c3f258d799aad4316671cb69 AS builder
+#
+# --platform=$BUILDPLATFORM pins this stage to the *builder's* native
+# platform even when buildx is asked for a foreign TARGETPLATFORM (the
+# multi-arch image job below builds linux/amd64 and linux/arm64 in one
+# invocation). Go cross-compiles cleanly, so there is no reason to run the
+# actual compiler under QEMU emulation — only the trivial `apk add`/`rm`
+# steps in the runtime stages below still do, since those execute
+# target-arch binaries by nature.
+FROM --platform=$BUILDPLATFORM golang:1.25.13-alpine3.23@sha256:42fc3368d1c50170a452f2bf4a1dfd292a065870c3f258d799aad4316671cb69 AS builder
+
+# Set by buildx to the requested TARGETPLATFORM's OS/arch; unset (empty)
+# under a plain `docker build` with no buildx multi-platform request, which
+# is why the go build line below falls back to `go env` defaults for each.
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -64,7 +78,11 @@ RUN go mod download
 ARG VERSION=0.1.0
 
 # Same reproducibility flags as the released binaries (.github/workflows/build-runner.yml).
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=readonly -trimpath -buildvcs=false \
+# BuildKit always populates TARGETOS/TARGETARCH, even without an explicit
+# buildx --platform — a bare `docker build` gets the local daemon's own, so
+# this produces a binary that runs on this host exactly as before.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -mod=readonly -trimpath -buildvcs=false \
         -ldflags "-s -w -buildid= -X dragrace/internal/version.Version=${VERSION}" \
         -o /runner ./cmd/runner
 
